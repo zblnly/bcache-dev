@@ -1,0 +1,4 @@
+#!/bin/bash
+hd='http://atlas.evilpiepirate.org/git/linux-bcache.git/plain/drivers/md/bcache/'
+tl='?h=bcache-dev'
+ls|grep -v update|xargs -I__fn curl -o __fn ${hd}__fn${tl}
