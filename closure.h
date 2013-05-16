@@ -651,7 +651,7 @@ do {									\
 #define continue_at_nobarrier(_cl, _fn, _wq)				\
 do {									\
 	set_closure_fn(_cl, _fn, _wq);					\
-	closure_queue(cl);						\
+	closure_queue(_cl);						\
 	return;								\
 } while (0)
 

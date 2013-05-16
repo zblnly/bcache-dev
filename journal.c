@@ -113,16 +113,19 @@ static void journal_read_endio(struct bio *bio, int error)
 }
 
 static int journal_read_bucket(struct cache *ca, struct list_head *list,
-			       struct btree_op *op, unsigned bucket_index)
+			       unsigned bucket_index)
 {
 	struct journal_device *ja = &ca->journal;
 	struct bio *bio = &ja->bio;
 
 	struct journal_replay *i;
 	struct jset *j, *data = ca->set->journal.w[0].data;
+	struct closure cl;
 	unsigned len, left, offset = 0;
 	int ret = 0;
 	sector_t bucket = bucket_to_sector(ca->set, ca->sb.d[bucket_index]);
+
+	closure_init_stack(&cl);
 
 	pr_debug("reading %llu", (uint64_t) bucket);
 
@@ -137,11 +140,11 @@ reread:		left = ca->sb.bucket_size - offset;
 		bio->bi_size	= len << 9;
 
 		bio->bi_end_io	= journal_read_endio;
-		bio->bi_private = &op->cl;
+		bio->bi_private = &cl;
 		bch_bio_map(bio, data);
 
-		closure_bio_submit(bio, &op->cl, ca);
-		closure_sync(&op->cl);
+		closure_bio_submit(bio, &cl, ca);
+		closure_sync(&cl);
 
 		/* This function could be simpler now since we no longer write
 		 * journal entries that overlap bucket boundaries; this means
@@ -211,12 +214,11 @@ next_set:
 	return ret;
 }
 
-int bch_journal_read(struct cache_set *c, struct list_head *list,
-			struct btree_op *op)
+int bch_journal_read(struct cache_set *c, struct list_head *list)
 {
 #define read_bucket(b)							\
 	({								\
-		int ret = journal_read_bucket(ca, list, op, b);		\
+		int ret = journal_read_bucket(ca, list, b);		\
 		__set_bit(b, bitmap);					\
 		if (ret < 0)						\
 			return ret;					\
@@ -306,8 +308,8 @@ bsearch:
 	}
 
 	c->journal.seq = list_entry(list->prev,
-				    struct journal_replay,
-				    list)->j.seq;
+					struct journal_replay,
+					list)->j.seq;
 
 	return 0;
 #undef read_bucket
@@ -375,8 +377,9 @@ void bch_journal_mark(struct cache_set *c, struct list_head *list)
 	}
 }
 
-static int bch_journal_replay_key(struct cache_set *c, struct btree_op *op,
-				  struct bkey *k, atomic_t *pin)
+static int bch_journal_replay_key(struct cache_set *c, enum btree_id id,
+				  struct btree_op *op, struct bkey *k,
+				  atomic_t *pin)
 {
 	int ret;
 	struct keylist keys;
@@ -390,7 +393,7 @@ static int bch_journal_replay_key(struct cache_set *c, struct btree_op *op,
 
 	op->journal = pin;
 
-	ret = bch_btree_insert(op, c, &keys);
+	ret = bch_btree_insert(op, c, id, &keys);
 
 	BUG_ON(!bch_keylist_empty(&keys));
 
@@ -399,8 +402,7 @@ static int bch_journal_replay_key(struct cache_set *c, struct btree_op *op,
 	return ret;
 }
 
-int bch_journal_replay(struct cache_set *s, struct list_head *list,
-		       struct btree_op *op)
+int bch_journal_replay(struct cache_set *c, struct list_head *list)
 {
 	int ret = 0, keys = 0, entries = 0;
 	struct bkey *k;
@@ -410,8 +412,11 @@ int bch_journal_replay(struct cache_set *s, struct list_head *list,
 
 	uint64_t start = i->j.last_seq, end = i->j.seq, n = start;
 	struct keylist keylist;
+	struct btree_op op;
 
 	bch_keylist_init(&keylist);
+	bch_btree_op_init_stack(&op);
+	op.lock = SHRT_MAX;
 
 	list_for_each_entry(i, list, list) {
 		BUG_ON(i->pin && atomic_read(i->pin) != 1);
@@ -427,7 +432,8 @@ int bch_journal_replay(struct cache_set *s, struct list_head *list,
 			for (k = j0->start;
 			     k < end(j0);
 			     k = bkey_next(k)) {
-				bch_journal_replay_key(s, op, k, i->pin);
+				bch_journal_replay_key(c, BTREE_ID_EXTENTS,
+						       &op, k, i->pin);
 				if (ret)
 					goto err;
 
@@ -435,7 +441,8 @@ int bch_journal_replay(struct cache_set *s, struct list_head *list,
 			}
 		} else
 			for_each_extent_jset_keys(k, jkeys, &i->j) {
-				bch_journal_replay_key(s, op, k, i->pin);
+				bch_journal_replay_key(c, BTREE_ID_EXTENTS,
+						       &op, k, i->pin);
 				if (ret)
 					goto err;
 
@@ -457,7 +464,6 @@ int bch_journal_replay(struct cache_set *s, struct list_head *list,
 		kfree(i);
 	}
 err:
-	closure_sync(&op->cl);
 	return ret;
 }
 

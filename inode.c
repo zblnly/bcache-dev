@@ -17,8 +17,7 @@ void bch_inode_rm(struct cache_set *c, uint64_t inode_nr)
 	SET_KEY_DELETED(&inode.k, 1);
 
 	bch_keylist_add(&keys, &inode.k);
-	bch_btree_insert(&op, c, &keys);
-	closure_sync(&op.cl);
+	bch_btree_insert(&op, c, BTREE_ID_INODES, &keys);
 }
 
 struct uuid_op {
@@ -27,54 +26,38 @@ struct uuid_op {
 	struct keylist		keys;
 };
 
-static int uuid_inode_write_new_fn(struct btree_op *op, struct btree *b)
+static int uuid_inode_write_new_fn(struct btree_op *op, struct btree *b,
+				   struct bkey *k)
 {
 	struct uuid_op *u = container_of(op, struct uuid_op, op);
-	struct bkey *k, *search = PRECEDING_KEY(&KEY(op->c->unused_inode_hint, 0, 0));
-	struct btree_iter iter;
 
-	bch_btree_iter_init(b, &iter, search);
-
-	while ((k = bch_btree_iter_next_filter(&iter, b, bch_ptr_bad))) {
-		if (op->c->unused_inode_hint < KEY_INODE(k)) {
-			/* Found a gap */
+	if (k) {
+		if (b->c->unused_inode_hint < KEY_INODE(k))
 			goto insert;
-		} else {
-			op->c->unused_inode_hint = KEY_INODE(k) + 1;
-
-			if (op->c->unused_inode_hint == UUID_INODE_MAX) {
-				op->c->unused_inode_hint = 0;
-
-				return 0; /* XXX */
-			}
-		}
-	}
-
-	if (op->c->unused_inode_hint <= KEY_INODE(&b->key)) {
-		k = &b->key;
-		goto insert;
 	} else {
-		op->c->unused_inode_hint = KEY_INODE(&b->key) + 1;
-
-		if (op->c->unused_inode_hint == UUID_INODE_MAX) {
-			op->c->unused_inode_hint = 0;
-
-			return 0; /* XXX */
-		}
+		k = &b->key;
+		if (b->c->unused_inode_hint <= KEY_INODE(k))
+			goto insert;
 	}
 
-	return 0;
-insert:
-	SET_KEY_INODE(&u->inode->k, op->c->unused_inode_hint);
+	b->c->unused_inode_hint = KEY_INODE(k) + 1;
 
-	op->c->unused_inode_hint = KEY_INODE(&u->inode->k) + 1;
-	op->c->unused_inode_hint %= UUID_INODE_MAX;
+	if (b->c->unused_inode_hint == UUID_INODE_MAX) {
+		b->c->unused_inode_hint = 0;
+		return -EINVAL;
+	}
+
+	return MAP_CONTINUE;
+insert:
+	/* Found a gap */
+	SET_KEY_INODE(&u->inode->k, b->c->unused_inode_hint);
+
+	b->c->unused_inode_hint = KEY_INODE(&u->inode->k) + 1;
+	b->c->unused_inode_hint %= UUID_INODE_MAX;
 
 	pr_info("inserting inode %llu, unused_inode_hint now %llu",
 		 KEY_INODE(&u->inode->k),
-		 op->c->unused_inode_hint);
-
-	op->lookup_done = true;
+		 b->c->unused_inode_hint);
 
 	bch_keylist_add(&u->keys, &u->inode->k);
 
@@ -83,22 +66,25 @@ insert:
 
 int bch_uuid_inode_write_new(struct cache_set *c, struct bch_inode_uuid *u)
 {
+	int ret;
 	struct uuid_op op;
 	struct bkey *search = PRECEDING_KEY(&KEY(c->unused_inode_hint, 0, 0));
+	uint64_t hint = c->unused_inode_hint;
 
 	bch_btree_op_init_stack(&op.op);
 	bch_keylist_init(&op.keys);
-	op.op.c = c;
 	op.inode = u;
 
-	bch_btree_map_nodes(&op.op, BTREE_ID_INODES, search,
-			    uuid_inode_write_new_fn);
-	closure_sync(&op.op.cl);
+	ret = bch_btree_map_keys(&op.op, c, BTREE_ID_INODES, search,
+				 uuid_inode_write_new_fn, 1);
+	if (!ret)
+		return ret;
 
-	if (!op.op.lookup_done)
-		return -EINVAL;
+	if (hint)
+		ret = bch_btree_map_keys(&op.op, c, BTREE_ID_INODES, &ZERO_KEY,
+					 uuid_inode_write_new_fn, 1);
 
-	return 0;
+	return ret;
 }
 
 void bch_uuid_inode_write(struct cache_set *c, struct bch_inode_uuid *u)
@@ -111,48 +97,41 @@ void bch_uuid_inode_write(struct cache_set *c, struct bch_inode_uuid *u)
 
 	bch_keylist_add(&keys, &u->k);
 
-	bch_btree_insert(&op, c, &keys);
-	closure_sync(&op.cl);
+	bch_btree_insert(&op, c, BTREE_ID_INODES, &keys);
 }
 
-static bool uuid_inode_find_fn(struct btree_op *op, struct btree *b, struct bkey *k)
+static int uuid_inode_find_fn(struct btree_op *op, struct btree *b, struct bkey *k)
 {
 	struct uuid_op *u = container_of(op, struct uuid_op, op);
-	struct bch_inode_uuid *inode;
+	struct bch_inode_uuid *inode = (void *) k;
 
-	if (KEY_INODE(k) >= UUID_INODE_MAX)
-		return true;
-
-	inode = (void *) k;
-	if (!memcmp(u->inode->uuid, inode->uuid, 16)) {
+	if (KEY_INODE(k) >= UUID_INODE_MAX) {
+		return -EINVAL;
+	} else if (!memcmp(u->inode->uuid, inode->uuid, 16)) {
 		memcpy(u->inode, inode, sizeof(*inode));
-		return true;
+		return MAP_DONE;
 	}
 
-	return false;
+	return MAP_CONTINUE;
 }
 
 int bch_uuid_inode_find(struct cache_set *c, struct bch_inode_uuid *search)
 {
 	struct uuid_op op;
+	int ret;
 
 	bch_btree_op_init_stack(&op.op);
-	op.op.c = c;
 	op.inode = search;
 
 	SET_KEY_PTRS(&search->k, 0);
 
-	bch_btree_map_keys(&op.op, BTREE_ID_INODES,
-			   &ZERO_KEY, uuid_inode_find_fn);
+	ret = bch_btree_map_keys(&op.op, c, BTREE_ID_INODES,
+				 &ZERO_KEY, uuid_inode_find_fn, 0);
 
-	if (!KEY_PTRS(&search->k)) {
-		pr_info("inode %llu not found", KEY_INODE(&search->k));
-		return -1;
-	}
+	pr_info("inode %llu %s found", KEY_INODE(&search->k),
+		ret ? "not " : "");
 
-	pr_info("inode %llu found", KEY_INODE(&search->k));
-
-	return 0;
+	return ret;
 }
 
 /* Old UUID code */
@@ -208,7 +187,7 @@ static int uuid_io(struct cache_set *c, struct bkey *k,
 
 		bio->bi_end_io	= uuid_endio;
 		bio->bi_private = &cl;
-		bio_map(bio, uuids);
+		bch_bio_map(bio, uuids);
 
 		bch_submit_bbio(bio, c, k, i);
 		closure_sync(&cl);
@@ -279,7 +258,7 @@ char *bch_uuid_convert(struct cache_set *c, struct jset *j, struct closure *cl)
 		struct uuid_entry *u = uuids + i;
 		struct bch_inode_uuid ui;
 
-		if (is_zero(u->uuid, 16))
+		if (bch_is_zero(u->uuid, 16))
 			continue;
 
 		pr_debug("Slot %zi: %pU: %s: 1st: %u last: %u inv: %u",

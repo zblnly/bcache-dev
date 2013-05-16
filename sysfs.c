@@ -9,6 +9,7 @@
 #include "sysfs.h"
 #include "btree.h"
 #include "request.h"
+#include "writeback.h"
 
 #include <linux/blkdev.h>
 #include <linux/sort.h>
@@ -80,6 +81,9 @@ rw_attribute(writeback_rate_p_term_inverse);
 rw_attribute(writeback_rate_d_smooth);
 read_attribute(writeback_rate_debug);
 
+read_attribute(stripe_size);
+read_attribute(partial_stripes_expensive);
+
 rw_attribute(synchronous);
 rw_attribute(journal_delay_ms);
 rw_attribute(discard);
@@ -128,7 +132,7 @@ SHOW(__bch_cached_dev)
 		char derivative[20];
 		char target[20];
 		bch_hprint(dirty,
-		       atomic_long_read(&dc->disk.sectors_dirty) << 9);
+			   bcache_dev_sectors_dirty(&dc->disk) << 9);
 		bch_hprint(derivative,	dc->writeback_rate_derivative << 9);
 		bch_hprint(target,	dc->writeback_rate_target << 9);
 
@@ -144,7 +148,10 @@ SHOW(__bch_cached_dev)
 	}
 
 	sysfs_hprint(dirty_data,
-		     atomic_long_read(&dc->disk.sectors_dirty) << 9);
+		     bcache_dev_sectors_dirty(&dc->disk) << 9);
+
+	sysfs_hprint(stripe_size,	dc->disk.stripe_size << 9);
+	var_printf(partial_stripes_expensive,	"%u");
 
 	var_printf(sequential_merge,	"%i");
 	var_hprint(sequential_cutoff);
@@ -288,6 +295,8 @@ static struct attribute *bch_cached_dev_files[] = {
 	&sysfs_writeback_rate_d_smooth,
 	&sysfs_writeback_rate_debug,
 	&sysfs_dirty_data,
+	&sysfs_stripe_size,
+	&sysfs_partial_stripes_expensive,
 	&sysfs_sequential_cutoff,
 	&sysfs_sequential_merge,
 	&sysfs_clear_stats,

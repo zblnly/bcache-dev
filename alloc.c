@@ -152,7 +152,7 @@ static void discard_finish(struct work_struct *w)
 
 	mutex_unlock(&ca->set->bucket_lock);
 
-	closure_wake_up(&ca->set->bucket_wait);
+	wake_up(&ca->set->bucket_wait);
 	wake_up_process(ca->alloc_thread);
 
 	closure_put(&ca->set->cl);
@@ -425,7 +425,7 @@ static int bch_allocator_thread(void *arg)
 				do_discard(ca, bucket);
 			} else {
 				fifo_push(&ca->free, bucket);
-				closure_wake_up(&ca->set->bucket_wait);
+				wake_up(&ca->set->bucket_wait);
 			}
 		}
 
@@ -452,16 +452,35 @@ static int bch_allocator_thread(void *arg)
 	}
 }
 
-long bch_bucket_alloc(struct cache *ca, unsigned watermark, struct closure *cl)
+long bch_bucket_alloc(struct cache *ca, unsigned watermark, bool wait)
 {
+	DEFINE_WAIT(w);
 	long r = -1;
-again:
-	wake_up_process(ca->alloc_thread);
+	struct bucket *b;
 
-	if (fifo_used(&ca->free) > ca->watermark[watermark] &&
-	    fifo_pop(&ca->free, r)) {
-		struct bucket *b = ca->buckets + r;
+	while (1) {
+		wake_up_process(ca->alloc_thread);
+
+		if (fifo_used(&ca->free) > ca->watermark[watermark] &&
+		    fifo_pop(&ca->free, r))
+			break;
+
+		if (!wait)
+			return -1;
+
+		prepare_to_wait(&ca->set->bucket_wait, &w,
+				TASK_UNINTERRUPTIBLE);
+
+		mutex_unlock(&ca->set->bucket_lock);
+		schedule();
+		mutex_lock(&ca->set->bucket_lock);
+	}
+
+	finish_wait(&ca->set->bucket_wait, &w);
+	b = ca->buckets + r;
+
 #ifdef CONFIG_BCACHE_EDEBUG
+	{
 		size_t iter;
 		long i;
 
@@ -474,36 +493,21 @@ again:
 			BUG_ON(i == r);
 		fifo_for_each(i, &ca->unused, iter)
 			BUG_ON(i == r);
+	}
 #endif
-		BUG_ON(atomic_read(&b->pin) != 1);
+	BUG_ON(atomic_read(&b->pin) != 1);
 
-		SET_GC_SECTORS_USED(b, ca->sb.bucket_size);
+	SET_GC_SECTORS_USED(b, ca->sb.bucket_size);
 
-		if (watermark <= WATERMARK_METADATA) {
-			SET_GC_MARK(b, GC_MARK_METADATA);
-			b->prio = BTREE_PRIO;
-		} else {
-			SET_GC_MARK(b, GC_MARK_RECLAIMABLE);
-			b->prio = INITIAL_PRIO;
-		}
-
-		return r;
+	if (watermark <= WATERMARK_METADATA) {
+		SET_GC_MARK(b, GC_MARK_METADATA);
+		b->prio = BTREE_PRIO;
+	} else {
+		SET_GC_MARK(b, GC_MARK_RECLAIMABLE);
+		b->prio = INITIAL_PRIO;
 	}
 
-	trace_bcache_alloc_fail(ca);
-
-	if (cl) {
-		closure_wait(&ca->set->bucket_wait, cl);
-
-		if (closure_blocking(cl)) {
-			mutex_unlock(&ca->set->bucket_lock);
-			closure_sync(cl);
-			mutex_lock(&ca->set->bucket_lock);
-			goto again;
-		}
-	}
-
-	return -1;
+	return r;
 }
 
 void bch_bucket_free(struct cache_set *c, struct bkey *k)
@@ -520,7 +524,7 @@ void bch_bucket_free(struct cache_set *c, struct bkey *k)
 }
 
 int __bch_bucket_alloc_set(struct cache_set *c, unsigned watermark,
-			   struct bkey *k, int n, struct closure *cl)
+			   struct bkey *k, int n, bool wait)
 {
 	int i;
 
@@ -533,7 +537,7 @@ int __bch_bucket_alloc_set(struct cache_set *c, unsigned watermark,
 
 	for (i = 0; i < n; i++) {
 		struct cache *ca = c->cache_by_alloc[i];
-		long b = bch_bucket_alloc(ca, watermark, cl);
+		long b = bch_bucket_alloc(ca, watermark, wait);
 
 		if (b == -1)
 			goto err;
@@ -553,11 +557,11 @@ err:
 }
 
 int bch_bucket_alloc_set(struct cache_set *c, unsigned watermark,
-			 struct bkey *k, int n, struct closure *cl)
+			 struct bkey *k, int n, bool wait)
 {
 	int ret;
 	mutex_lock(&c->bucket_lock);
-	ret = __bch_bucket_alloc_set(c, watermark, k, n, cl);
+	ret = __bch_bucket_alloc_set(c, watermark, k, n, wait);
 	mutex_unlock(&c->bucket_lock);
 	return ret;
 }

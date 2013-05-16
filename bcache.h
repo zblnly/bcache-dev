@@ -378,11 +378,7 @@ struct keybuf_key {
 	void			*private;
 };
 
-typedef bool (keybuf_pred_fn)(struct keybuf *, struct bkey *);
-
 struct keybuf {
-	keybuf_pred_fn		*key_predicate;
-
 	struct bkey		last_scanned;
 	spinlock_t		lock;
 
@@ -435,8 +431,10 @@ struct bcache_device {
 	/* If nonzero, we're detaching/unregistering from cache set */
 	atomic_t		detaching;
 
-	atomic_long_t		sectors_dirty;
-	unsigned long		sectors_dirty_gc;
+	uint64_t		nr_stripes;
+	unsigned		stripe_size;
+	atomic_t		*stripe_sectors_dirty;
+
 	unsigned long		sectors_dirty_last;
 	long			sectors_dirty_derivative;
 
@@ -528,6 +526,7 @@ struct cached_dev {
 	unsigned		sequential_merge:1;
 	unsigned		verify:1;
 
+	unsigned		partial_stripes_expensive:1;
 	unsigned		writeback_metadata:1;
 	unsigned		writeback_running:1;
 	unsigned char		writeback_percent;
@@ -747,8 +746,8 @@ struct cache_set {
 	 * basically a lock for this that we can wait on asynchronously. The
 	 * btree_root() macro releases the lock when it returns.
 	 */
-	struct closure		*try_harder;
-	struct closure_waitlist	try_wait;
+	struct task_struct	*try_harder;
+	wait_queue_head_t	try_wait;
 	uint64_t		try_harder_start;
 
 	/*
@@ -762,7 +761,7 @@ struct cache_set {
 	 * written.
 	 */
 	atomic_t		prio_blocked;
-	struct closure_waitlist	bucket_wait;
+	wait_queue_head_t	bucket_wait;
 
 	/*
 	 * For any bio we don't skip we subtract the number of sectors from
@@ -829,6 +828,7 @@ struct cache_set {
 	 */
 	struct mutex		sort_lock;
 	struct bset		*sort;
+	unsigned		sort_crit_factor;
 
 	/* List of buckets we're currently writing data to */
 	struct list_head	data_buckets;
@@ -1153,9 +1153,6 @@ static inline void wake_up_allocators(struct cache_set *c)
 
 /* Forward declarations */
 
-void bch_writeback_queue(struct cached_dev *);
-void bch_writeback_add(struct cached_dev *, unsigned);
-
 void bch_count_io_errors(struct cache *, int, const char *);
 void bch_bbio_count_io_errors(struct cache_set *, struct bio *,
 			      int, const char *);
@@ -1171,13 +1168,13 @@ void bch_submit_bbio(struct bio *, struct cache_set *, struct bkey *, unsigned);
 void bch_rescale_priorities(struct cache_set *, int);
 bool bch_bucket_add_unused(struct cache *, struct bucket *);
 
-long bch_bucket_alloc(struct cache *, unsigned, struct closure *);
+long bch_bucket_alloc(struct cache *, unsigned, bool);
 void bch_bucket_free(struct cache_set *, struct bkey *);
 
 int __bch_bucket_alloc_set(struct cache_set *, unsigned,
-			   struct bkey *, int, struct closure *);
+			   struct bkey *, int, bool);
 int bch_bucket_alloc_set(struct cache_set *, unsigned,
-			 struct bkey *, int, struct closure *);
+			 struct bkey *, int, bool);
 
 __printf(2, 3)
 bool bch_cache_set_error(struct cache_set *, const char *, ...);
@@ -1219,7 +1216,6 @@ void bch_cache_set_stop(struct cache_set *);
 struct cache_set *bch_cache_set_alloc(struct cache_sb *);
 void bch_btree_cache_free(struct cache_set *);
 int bch_btree_cache_alloc(struct cache_set *);
-void bch_writeback_init_cached_dev(struct cached_dev *);
 void bch_moving_init_cache_set(struct cache_set *);
 
 int bch_cache_allocator_start(struct cache *ca);

@@ -6,13 +6,18 @@
 struct search {
 	/* Stack frame for bio_complete */
 	struct closure		cl;
+	struct closure		btree;
 
 	struct bcache_device	*d;
+	struct cache_set	*c;
 	struct task_struct	*task;
 
 	struct bbio		bio;
 	struct bio		*orig_bio;
 	struct bio		*cache_miss;
+
+	/* Bio to be inserted into the cache */
+	struct bio		*cache_bio;
 	unsigned		cache_bio_sectors;
 
 	unsigned		recoverable:1;
@@ -20,6 +25,14 @@ struct search {
 
 	unsigned		write:1;
 	unsigned		writeback:1;
+
+	unsigned		csum:1;
+	unsigned		bypass:1;
+	unsigned		flush_journal:1;
+
+	unsigned		insert_data_done:1;
+
+	uint16_t		write_prio;
 
 	/* IO error returned to s->bio */
 	short			error;

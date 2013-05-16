@@ -225,18 +225,8 @@ void __bkey_put(struct cache_set *c, struct bkey *k);
 /* Recursing down the btree */
 
 struct btree_op {
-	struct closure		cl;
-	struct cache_set	*c;
-
 	/* Journal entry we have a refcount on */
 	atomic_t		*journal;
-
-	/* Bio to be inserted into the cache */
-	struct bio		*cache_bio;
-
-	unsigned		inode;
-
-	uint16_t		write_prio;
 
 	/* Btree level at which we start taking write locks */
 	short			lock;
@@ -247,12 +237,6 @@ struct btree_op {
 		BTREE_REPLACE
 	} type:8;
 
-	unsigned		csum:1;
-	unsigned		bypass:1;
-	unsigned		flush_journal:1;
-
-	unsigned		insert_data_done:1;
-	unsigned		lookup_done:1;
 	unsigned		insert_collision:1;
 
 	BKEY_PADDED(replace);
@@ -290,67 +274,7 @@ static inline void rw_unlock(bool w, struct btree *b)
 	(w ? up_write : up_read)(&b->lock);
 }
 
-#define insert_lock(s, b)	((b)->level <= (s)->lock)
-
 #define btree_node_root(b)	((b)->c->btree_roots[(b)->btree_id])
-
-/*
- * These macros are for recursing down the btree - they handle the details of
- * locking and looking up nodes in the cache for you. They're best treated as
- * mere syntax when reading code that uses them.
- *
- * op->lock determines whether we take a read or a write lock at a given depth.
- * If you've got a read lock and find that you need a write lock (i.e. you're
- * going to have to split), set op->lock and return -EINTR; btree_root() will
- * call you again and you'll have the correct lock.
- */
-
-/**
- * btree - recurse down the btree on a specified key
- * @fn:		function to call, which will be passed the child node
- * @key:	key to recurse on
- * @b:		parent btree node
- * @op:		pointer to struct btree_op
- */
-#define btree(fn, key, b, op, ...)					\
-({									\
-	int _r, l = (b)->level - 1;					\
-	bool _w = l <= (op)->lock;					\
-	struct btree *_child = bch_btree_node_get((b)->c, key, l,	\
-						  b->btree_id, op);	\
-	if (!IS_ERR(_child)) {						\
-		_child->parent = (b);					\
-		_r = bch_btree_ ## fn(_child, op, ##__VA_ARGS__);	\
-		rw_unlock(_w, _child);					\
-	} else								\
-		_r = PTR_ERR(_child);					\
-	_r;								\
-})
-
-/**
- * btree_root - call a function on the root of the btree
- * @fn:		function to call, which will be passed the child node
- * @c:		cache set
- * @op:		pointer to struct btree_op
- */
-#define btree_root(fn, c, id, op, ...)					\
-({									\
-	int _r = -EINTR;						\
-	do {								\
-		struct btree *_b = (c)->btree_roots[id];		\
-		bool _w = insert_lock(op, _b);				\
-		rw_lock(_w, _b, _b->level);				\
-		if (_b == (c)->btree_roots[id] &&			\
-		    _w == insert_lock(op, _b)) {			\
-			_b->parent = NULL;				\
-			_r = bch_btree_ ## fn(_b, op, ##__VA_ARGS__);	\
-		}							\
-		rw_unlock(_w, _b);					\
-		bch_cannibalize_unlock(c, &(op)->cl);			\
-	} while (_r == -EINTR);						\
-									\
-	_r;								\
-})
 
 static inline bool should_split(struct btree *b)
 {
@@ -361,47 +285,53 @@ static inline bool should_split(struct btree *b)
 }
 
 void bch_btree_node_read(struct btree *);
-void bch_btree_node_read_done(struct btree *);
 void bch_btree_node_write(struct btree *, struct closure *);
 
-void bch_cannibalize_unlock(struct cache_set *, struct closure *);
 void bch_btree_set_root(struct btree *);
-struct btree *bch_btree_node_alloc(struct cache_set *, int,
-				   enum btree_id id, struct closure *);
+struct btree *bch_btree_node_alloc(struct cache_set *, int, enum btree_id);
 struct btree *bch_btree_node_get(struct cache_set *, struct bkey *,
-				int, enum btree_id, struct btree_op *);
+				 int, enum btree_id, bool);
 
-bool bch_btree_insert_keys(struct btree *, struct btree_op *,
-			   struct keylist *);
 bool bch_btree_insert_check_key(struct btree *, struct btree_op *,
-				   struct bio *);
-int bch_btree_insert(struct btree_op *, struct cache_set *, struct keylist *);
+				unsigned, struct bio *);
+int bch_btree_insert(struct btree_op *, struct cache_set *,
+		     enum btree_id, struct keylist *);
 int bch_btree_insert_node(struct btree *, struct btree_op *, struct keylist *);
 
-int bch_btree_search_recurse(struct btree *, struct btree_op *);
+void bch_btree_search_async(struct closure *);
 
 void bch_queue_gc(struct cache_set *);
 size_t bch_btree_gc_finish(struct cache_set *);
 void bch_moving_gc(struct closure *);
-int bch_btree_check(struct cache_set *, struct btree_op *);
+int bch_btree_check(struct cache_set *);
 uint8_t __bch_btree_mark_key(struct cache_set *, int, struct bkey *);
 
-typedef bool (btree_map_keys_fn)(struct btree_op *, struct btree *,
-				 struct bkey *);
-int bch_btree_map_keys(struct btree_op *, enum btree_id,
-		       struct bkey *, btree_map_keys_fn *);
-
 typedef int (btree_map_nodes_fn)(struct btree_op *, struct btree *);
-int bch_btree_map_nodes(struct btree_op *op, enum btree_id id,
-			struct bkey *from, btree_map_nodes_fn *fn);
 
-void bch_keybuf_init(struct keybuf *, keybuf_pred_fn *);
-void bch_refill_keybuf(struct cache_set *, struct keybuf *, struct bkey *);
+#define MAP_DONE	0
+#define MAP_CONTINUE	1
+
+#define MAP_LEAF_NODES	0
+#define MAP_ALL_NODES	1
+
+int bch_btree_map_nodes(struct btree_op *, struct cache_set *, enum btree_id,
+			struct bkey *, btree_map_nodes_fn *, int);
+
+typedef int (btree_map_keys_fn)(struct btree_op *, struct btree *,
+				struct bkey *);
+int bch_btree_map_keys(struct btree_op *, struct cache_set *, enum btree_id,
+		       struct bkey *, btree_map_keys_fn *, int);
+
+typedef bool (keybuf_pred_fn)(struct keybuf *, struct bkey *);
+
+void bch_keybuf_init(struct keybuf *);
+void bch_refill_keybuf(struct cache_set *, struct keybuf *,
+		       struct bkey *, keybuf_pred_fn *);
 bool bch_keybuf_check_overlapping(struct keybuf *, struct bkey *,
 				  struct bkey *);
 void bch_keybuf_del(struct keybuf *, struct keybuf_key *);
 struct keybuf_key *bch_keybuf_next(struct keybuf *);
-struct keybuf_key *bch_keybuf_next_rescan(struct cache_set *,
-					  struct keybuf *, struct bkey *);
+struct keybuf_key *bch_keybuf_next_rescan(struct cache_set *, struct keybuf *,
+					  struct bkey *, keybuf_pred_fn *);
 
 #endif

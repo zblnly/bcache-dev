@@ -250,10 +250,8 @@ atomic_t *bch_journal(struct cache_set *, struct keylist *, struct closure *);
 void bch_journal_next(struct journal *);
 void bch_journal_mark(struct cache_set *, struct list_head *);
 void bch_journal_meta(struct cache_set *, struct closure *);
-int bch_journal_read(struct cache_set *, struct list_head *,
-			struct btree_op *);
-int bch_journal_replay(struct cache_set *, struct list_head *,
-			  struct btree_op *);
+int bch_journal_read(struct cache_set *, struct list_head *);
+int bch_journal_replay(struct cache_set *, struct list_head *);
 
 void bch_journal_free(struct cache_set *);
 int bch_journal_alloc(struct cache_set *);
