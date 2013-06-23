@@ -650,10 +650,11 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
 
 	mutex_init(&d->inode_lock);
 
-	if (!d->stripe_size)
-		d->stripe_size = 1U << 31;
+	if (!d->stripe_size_bits)
+		d->stripe_size_bits = 31;
 
-	d->nr_stripes = DIV_ROUND_UP(sectors, d->stripe_size);
+	d->nr_stripes = round_up(sectors, 1 << d->stripe_size_bits) >>
+		d->stripe_size_bits;
 
 	if (!d->nr_stripes || d->nr_stripes > SIZE_MAX / sizeof(atomic_t))
 		return -ENOMEM;
@@ -949,6 +950,7 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 	kobject_init(&dc->disk.kobj, &bch_cached_dev_ktype);
 	INIT_WORK(&dc->detach, cached_dev_detach_finish);
 	closure_init_unlocked(&dc->sb_write);
+	init_waitqueue_head(&dc->writeback_wait);
 	INIT_LIST_HEAD(&dc->io_lru);
 	spin_lock_init(&dc->io_lock);
 	bch_cache_accounting_init(&dc->accounting, &dc->disk.cl);
@@ -961,8 +963,10 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 		hlist_add_head(&io->hash, dc->io_hash + RECENT_IO);
 	}
 
-	dc->disk.stripe_size = q->limits.io_opt >> 9;
-	if (dc->disk.stripe_size)
+	if (is_power_of_2(q->limits.io_opt))
+		dc->disk.stripe_size_bits = ilog2(q->limits.io_opt >> 9);
+
+	if (dc->disk.stripe_size_bits)
 		dc->partial_stripes_expensive =
 			q->limits.raid_partial_stripes_expensive;
 
@@ -1321,6 +1325,7 @@ struct cache_set *bch_cache_set_alloc(struct cache_sb *sb)
 	mutex_init(&c->sort_lock);
 	spin_lock_init(&c->btree_root_lock);
 	spin_lock_init(&c->sort_time_lock);
+	init_waitqueue_head(&c->moving_gc_wait);
 	closure_init_unlocked(&c->sb_write);
 	spin_lock_init(&c->btree_read_time_lock);
 	bch_moving_init_cache_set(c);

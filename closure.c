@@ -40,7 +40,7 @@ static inline void closure_put_after_sub(struct closure *cl, int flags)
 	int r = flags & CLOSURE_REMAINING_MASK;
 
 	BUG_ON(flags & CLOSURE_GUARD_MASK);
-	BUG_ON(!r && (flags & ~(CLOSURE_DESTRUCTOR|CLOSURE_BLOCKING)));
+	BUG_ON(!r && (flags & ~CLOSURE_DESTRUCTOR));
 
 	/* Must deliver precisely one wakeup */
 	if (r == 1 && (flags & CLOSURE_SLEEPING))
@@ -48,7 +48,6 @@ static inline void closure_put_after_sub(struct closure *cl, int flags)
 
 	if (!r) {
 		if (cl->fn && !(flags & CLOSURE_DESTRUCTOR)) {
-			/* CLOSURE_BLOCKING might be set - clear it */
 			atomic_set(&cl->remaining,
 				   CLOSURE_REMAINING_INITIALIZER);
 			closure_queue(cl);
@@ -192,8 +191,8 @@ void __closure_lock(struct closure *cl, struct closure *parent,
 		if (closure_trylock(cl, parent))
 			return;
 
-		closure_wait_event_sync(wait_list, &wait,
-					atomic_read(&cl->remaining) == -1);
+		closure_wait_event(wait_list, &wait,
+				   atomic_read(&cl->remaining) == -1);
 	}
 }
 EXPORT_SYMBOL_GPL(__closure_lock);
@@ -291,11 +290,10 @@ static int debug_seq_show(struct seq_file *f, void *data)
 			   cl, (void *) cl->ip, cl->fn, cl->parent,
 			   r & CLOSURE_REMAINING_MASK);
 
-		seq_printf(f, "%s%s%s%s%s%s\n",
+		seq_printf(f, "%s%s%s%s%s\n",
 			   test_bit(WORK_STRUCT_PENDING,
 				    work_data_bits(&cl->work)) ? "Q" : "",
 			   r & CLOSURE_RUNNING	? "R" : "",
-			   r & CLOSURE_BLOCKING	? "B" : "",
 			   r & CLOSURE_STACK	? "S" : "",
 			   r & CLOSURE_SLEEPING	? "Sl" : "",
 			   r & CLOSURE_TIMER	? "T" : "");

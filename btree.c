@@ -421,7 +421,7 @@ static void do_btree_node_write(struct btree *b)
 	b->bio = bch_bbio_alloc(b->c);
 
 	b->bio->bi_end_io	= btree_node_write_endio;
-	b->bio->bi_private	= &b->io.cl;
+	b->bio->bi_private	= cl;
 	b->bio->bi_rw	= REQ_META|WRITE_SYNC;
 	b->bio->bi_size	= set_blocks(i, b->c) * block_bytes(b->c);
 	bch_bio_map(b->bio, i);
@@ -684,8 +684,8 @@ static int mca_reap(struct btree *b, unsigned min_order, bool flush)
 	}
 
 	/* wait for any in flight btree write */
-	closure_wait_event_sync(&b->io.wait, &cl,
-		atomic_read(&b->io.cl.remaining) == -1);
+	closure_wait_event(&b->io.wait, &cl,
+			   atomic_read(&b->io.cl.remaining) == -1);
 
 	return 0;
 }
@@ -715,6 +715,13 @@ static int bch_mca_shrink(struct shrinker *shrink, struct shrink_control *sc)
 	else if (!mutex_trylock(&c->bucket_lock))
 		return -1;
 
+	/*
+	 * It's _really_ critical that we don't free too many btree nodes - we
+	 * have to always leave ourselves a reserve. The reserve is how we
+	 * guarantee that allocating memory for a new btree node can always
+	 * succeed, so that inserting keys into the btree can always succeed and
+	 * IO can always make forward progress:
+	 */
 	nr /= c->btree_pages;
 	nr = min_t(unsigned long, nr, mca_can_free(c));
 

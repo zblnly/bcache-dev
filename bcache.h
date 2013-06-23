@@ -432,7 +432,7 @@ struct bcache_device {
 	atomic_t		detaching;
 
 	uint64_t		nr_stripes;
-	unsigned		stripe_size;
+	unsigned		stripe_size_bits;
 	atomic_t		*stripe_sectors_dirty;
 
 	unsigned long		sectors_dirty_last;
@@ -505,7 +505,7 @@ struct cached_dev {
 	/* Number of writeback bios in flight */
 	atomic_t		in_flight;
 	struct closure_with_timer writeback;
-	struct closure_waitlist	writeback_wait;
+	wait_queue_head_t	writeback_wait;
 
 	struct keybuf		writeback_keys;
 
@@ -799,7 +799,7 @@ struct cache_set {
 	atomic_t		sectors_to_gc;
 
 	struct closure		moving_gc;
-	struct closure_waitlist	moving_gc_wait;
+	wait_queue_head_t	moving_gc_wait;
 	struct keybuf		moving_gc_keys;
 	/* Number of moving GC bios in flight */
 	atomic_t		in_flight;

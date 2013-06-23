@@ -114,20 +114,21 @@ static bool dirty_full_stripe_pred(struct keybuf *buf, struct bkey *k)
 	unsigned nr_sectors = KEY_SIZE(k);
 	struct cached_dev *dc = container_of(buf, struct cached_dev,
 					     writeback_keys);
+	unsigned stripe_size = 1 << dc->disk.stripe_size_bits;
 
 	if (!KEY_DIRTY(k))
 		return false;
 
-	stripe = KEY_START(k) / dc->disk.stripe_size;
+	stripe = KEY_START(k) >> dc->disk.stripe_size_bits;
 	while (1) {
 		if (atomic_read(dc->disk.stripe_sectors_dirty + stripe) !=
-		    dc->disk.stripe_size)
+		    stripe_size)
 			return false;
 
-		if (nr_sectors <= dc->disk.stripe_size)
+		if (nr_sectors <= stripe_size)
 			return true;
 
-		nr_sectors -= dc->disk.stripe_size;
+		nr_sectors -= stripe_size;
 		stripe++;
 	}
 }
@@ -181,7 +182,7 @@ static void refill_dirty(struct closure *cl)
 
 		for (i = 0; i < dc->disk.nr_stripes; i++)
 			if (atomic_read(dc->disk.stripe_sectors_dirty + i) ==
-			    dc->disk.stripe_size)
+			    1 << dc->disk.stripe_size_bits)
 				goto full_stripes;
 
 		goto normal_refill;
@@ -247,19 +248,20 @@ void bcache_dev_sectors_dirty_add(struct cache_set *c, unsigned inode,
 				  uint64_t offset, int nr_sectors)
 {
 	struct bcache_device *d;
-	unsigned stripe_offset;
+	unsigned stripe_size, stripe_offset;
 	uint64_t stripe;
 
 	d = bch_dev_get_by_inode(c, inode);
 	if (!d)
 		return;
 
-	stripe_offset = offset % d->stripe_size;
-	stripe = offset / d->stripe_size;
+	stripe = offset >> d->stripe_size_bits;
+	stripe_size = 1 << d->stripe_size_bits;
+	stripe_offset = offset & (stripe_size - 1);
 
 	while (nr_sectors) {
 		int s = min_t(unsigned, abs(nr_sectors),
-			      d->stripe_size - stripe_offset);
+			      stripe_size - stripe_offset);
 
 		if (nr_sectors < 0)
 			s = -s;
@@ -322,7 +324,7 @@ static void write_dirty_finish(struct closure *cl)
 	bch_keybuf_del(&dc->writeback_keys, w);
 	atomic_dec_bug(&dc->in_flight);
 
-	closure_wake_up(&dc->writeback_wait);
+	wake_up(&dc->writeback_wait);
 
 	closure_return_with_destructor(cl, dirty_io_destructor);
 }
@@ -431,10 +433,8 @@ static void read_dirty(struct closure *cl)
 		delay = writeback_delay(dc, KEY_SIZE(&w->key));
 
 		atomic_inc(&dc->in_flight);
-
-		if (!closure_wait_event(&dc->writeback_wait, cl,
-					atomic_read(&dc->in_flight) < 64))
-			continue_at(cl, read_dirty, dirty_wq);
+		wait_event(dc->writeback_wait,
+			   atomic_read(&dc->in_flight) < 64);
 	}
 
 	if (0) {

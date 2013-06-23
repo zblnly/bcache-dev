@@ -57,7 +57,7 @@ static void write_moving_finish(struct closure *cl)
 	bch_keybuf_del(&io->s.c->moving_gc_keys, io->w);
 
 	atomic_dec_bug(&io->s.c->in_flight);
-	closure_wake_up(&io->s.c->moving_gc_wait);
+	wake_up(&io->s.c->moving_gc_wait);
 
 	closure_return_with_destructor(cl, moving_io_destructor);
 }
@@ -164,11 +164,9 @@ static void read_moving(struct closure *cl)
 
 		closure_call(&io->s.cl, read_moving_submit, NULL, &c->gc.cl);
 
-		if (atomic_inc_return(&c->in_flight) >= 64) {
-			closure_wait_event(&c->moving_gc_wait, cl,
-					   atomic_read(&c->in_flight) < 64);
-			continue_at(cl, read_moving, bch_gc_wq);
-		}
+		atomic_inc(&c->in_flight);
+		wait_event(c->moving_gc_wait,
+			   atomic_read(&c->in_flight) < 64);
 	}
 
 	if (0) {
