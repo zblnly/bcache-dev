@@ -99,10 +99,10 @@ bool bch_btree_ptr_invalid(struct cache_set *c, const struct bkey *k)
 	if (KEY_DELETED(k))
 		return true;
 
-	if (!KEY_SIZE(k))
+	if (!bkey_cmp(k, &ZERO_KEY)) /* old style freeing keys */
 		return true;
 
-	if (!KEY_PTRS(k) || KEY_DIRTY(k))
+	if (!KEY_PTRS(k) || !KEY_SIZE(k) || KEY_DIRTY(k))
 		goto bad;
 
 	if (__ptr_invalid(c, k))
@@ -181,9 +181,7 @@ bug:
 
 bool bch_btree_ptr_bad(struct btree *b, const struct bkey *k)
 {
-	if (!bkey_cmp(k, &ZERO_KEY) ||
-	    !KEY_PTRS(k) ||
-	    bch_btree_ptr_invalid(b->c, k))
+	if (bch_btree_ptr_invalid(b->c, k))
 		return true;
 
 	return __bch_btree_ptr_bad(b, k);
@@ -194,8 +192,7 @@ bool bch_extent_ptr_bad(struct btree *b, const struct bkey *k)
 	struct bucket *g;
 	unsigned i, stale;
 
-	if (!bkey_cmp(k, &ZERO_KEY) ||
-	    !KEY_PTRS(k) ||
+	if (!KEY_PTRS(k) ||
 	    bch_extent_ptr_invalid(b->c, k))
 		return true;
 
@@ -1014,14 +1011,6 @@ struct bkey *bch_btree_iter_next_filter(struct btree_iter *iter,
 	return ret;
 }
 
-struct bkey *bch_next_recurse_key(struct btree *b, struct bkey *search)
-{
-	struct btree_iter iter;
-
-	bch_btree_iter_init(b, &iter, search);
-	return bch_btree_iter_next_filter(&iter, b, bch_ptr_bad);
-}
-
 /* Mergesort */
 
 static void btree_sort_fixup_extents(struct btree_iter *iter)
@@ -1303,7 +1292,7 @@ static int btree_bset_stats(struct btree_op *op, struct btree *b)
 		}
 	}
 
-	return 0;
+	return MAP_CONTINUE;
 }
 
 int bch_bset_print_stats(struct cache_set *c, char *buf)
@@ -1318,12 +1307,10 @@ int bch_bset_print_stats(struct cache_set *c, char *buf)
 	for (id = 0; id < BTREE_ID_NR; id++)
 		if (c->btree_roots[id]) {
 			ret = bch_btree_map_nodes(&t.op, c, id, &ZERO_KEY,
-						  btree_bset_stats,
-						  MAP_ALL_NODES);
+						  btree_bset_stats);
 			if (ret)
 				return ret;
 		}
-
 
 	return snprintf(buf, PAGE_SIZE,
 			"btree nodes:		%zu\n"

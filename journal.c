@@ -7,7 +7,6 @@
 #include "bcache.h"
 #include "btree.h"
 #include "debug.h"
-#include "request.h"
 
 #include <trace/events/bcache.h>
 
@@ -308,8 +307,8 @@ bsearch:
 	}
 
 	c->journal.seq = list_entry(list->prev,
-					struct journal_replay,
-					list)->j.seq;
+				    struct journal_replay,
+				    list)->j.seq;
 
 	return 0;
 #undef read_bucket
@@ -378,23 +377,22 @@ void bch_journal_mark(struct cache_set *c, struct list_head *list)
 }
 
 static int bch_journal_replay_key(struct cache_set *c, enum btree_id id,
-				  struct btree_op *op, struct bkey *k,
-				  atomic_t *pin)
+				  struct bkey *k, atomic_t *journal_ref)
 {
 	int ret;
 	struct keylist keys;
+	struct btree_op op;
 
 	trace_bcache_journal_replay_key(k);
 
 	bch_keylist_init(&keys);
+	bch_btree_op_init_stack(&op);
+	op.lock = SHRT_MAX;
 
 	bkey_copy(keys.top, k);
 	bch_keylist_push(&keys);
 
-	op->journal = pin;
-
-	ret = bch_btree_insert(op, c, id, &keys);
-
+	ret = bch_btree_insert(&op, c, id, &keys, journal_ref);
 	BUG_ON(!bch_keylist_empty(&keys));
 
 	cond_resched();
@@ -402,7 +400,7 @@ static int bch_journal_replay_key(struct cache_set *c, enum btree_id id,
 	return ret;
 }
 
-int bch_journal_replay(struct cache_set *c, struct list_head *list)
+int bch_journal_replay(struct cache_set *s, struct list_head *list)
 {
 	int ret = 0, keys = 0, entries = 0;
 	struct bkey *k;
@@ -411,12 +409,6 @@ int bch_journal_replay(struct cache_set *c, struct list_head *list)
 		list_entry(list->prev, struct journal_replay, list);
 
 	uint64_t start = i->j.last_seq, end = i->j.seq, n = start;
-	struct keylist keylist;
-	struct btree_op op;
-
-	bch_keylist_init(&keylist);
-	bch_btree_op_init_stack(&op);
-	op.lock = SHRT_MAX;
 
 	list_for_each_entry(i, list, list) {
 		BUG_ON(i->pin && atomic_read(i->pin) != 1);
@@ -432,8 +424,8 @@ int bch_journal_replay(struct cache_set *c, struct list_head *list)
 			for (k = j0->start;
 			     k < end(j0);
 			     k = bkey_next(k)) {
-				bch_journal_replay_key(c, BTREE_ID_EXTENTS,
-						       &op, k, i->pin);
+				bch_journal_replay_key(s, BTREE_ID_EXTENTS,
+						       k, i->pin);
 				if (ret)
 					goto err;
 
@@ -441,8 +433,8 @@ int bch_journal_replay(struct cache_set *c, struct list_head *list)
 			}
 		} else
 			for_each_extent_jset_keys(k, jkeys, &i->j) {
-				bch_journal_replay_key(c, BTREE_ID_EXTENTS,
-						       &op, k, i->pin);
+				bch_journal_replay_key(s, BTREE_ID_EXTENTS,
+						       k, i->pin);
 				if (ret)
 					goto err;
 
@@ -457,13 +449,13 @@ int bch_journal_replay(struct cache_set *c, struct list_head *list)
 
 	pr_info("journal replay done, %i keys in %i entries, seq %llu",
 		keys, entries, end);
-
+err:
 	while (!list_empty(list)) {
 		i = list_first_entry(list, struct journal_replay, list);
 		list_del(&i->list);
 		kfree(i);
 	}
-err:
+
 	return ret;
 }
 
@@ -485,8 +477,8 @@ retry:
 			if (!best)
 				best = b;
 			else if (journal_pin_cmp(c,
-						 btree_current_write(best),
-						 btree_current_write(b))) {
+					btree_current_write(best)->journal,
+					btree_current_write(b)->journal)) {
 				best = b;
 			}
 		}
@@ -727,7 +719,7 @@ static void journal_write_unlocked(struct closure *cl)
 		bio_reset(bio);
 		bio->bi_sector	= PTR_OFFSET(k, i);
 		bio->bi_bdev	= ca->bdev;
-		bio->bi_rw	= REQ_WRITE|REQ_SYNC|REQ_META|REQ_FLUSH;
+		bio->bi_rw	= REQ_WRITE|REQ_SYNC|REQ_META|REQ_FLUSH|REQ_FUA;
 		bio->bi_size	= sectors << 9;
 
 		bio->bi_end_io	= journal_write_endio;

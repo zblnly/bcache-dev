@@ -230,8 +230,7 @@ struct journal_device {
 };
 
 #define journal_pin_cmp(c, l, r)				\
-	(fifo_idx(&(c)->journal.pin, (l)->journal) >		\
-	 fifo_idx(&(c)->journal.pin, (r)->journal))
+	(fifo_idx(&(c)->journal.pin, (l)) > fifo_idx(&(c)->journal.pin, (r)))
 
 #define JOURNAL_PIN	20000
 

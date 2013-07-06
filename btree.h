@@ -225,9 +225,6 @@ void __bkey_put(struct cache_set *c, struct bkey *k);
 /* Recursing down the btree */
 
 struct btree_op {
-	/* Journal entry we have a refcount on */
-	atomic_t		*journal;
-
 	/* Btree level at which we start taking write locks */
 	short			lock;
 
@@ -276,14 +273,6 @@ static inline void rw_unlock(bool w, struct btree *b)
 
 #define btree_node_root(b)	((b)->c->btree_roots[(b)->btree_id])
 
-static inline bool should_split(struct btree *b)
-{
-	struct bset *i = write_block(b);
-	return b->written >= btree_blocks(b) ||
-		(b->written + __set_blocks(i, i->keys + 15, b->c)
-		 > btree_blocks(b));
-}
-
 void bch_btree_node_read(struct btree *);
 void bch_btree_node_write(struct btree *, struct closure *);
 
@@ -292,30 +281,50 @@ struct btree *bch_btree_node_alloc(struct cache_set *, int, enum btree_id);
 struct btree *bch_btree_node_get(struct cache_set *, struct bkey *,
 				 int, enum btree_id, bool);
 
-bool bch_btree_insert_check_key(struct btree *, struct btree_op *,
-				unsigned, struct bio *);
+int bch_btree_insert_check_key(struct btree *, struct btree_op *,
+			       struct bkey *);
 int bch_btree_insert(struct btree_op *, struct cache_set *,
-		     enum btree_id, struct keylist *);
-int bch_btree_insert_node(struct btree *, struct btree_op *, struct keylist *);
+		     enum btree_id, struct keylist *, atomic_t *);
+int bch_btree_insert_node(struct btree *, struct btree_op *,
+			  struct keylist *, atomic_t *);
 
-void bch_btree_search_async(struct closure *);
-
-void bch_queue_gc(struct cache_set *);
+int bch_gc_thread_start(struct cache_set *);
 size_t bch_btree_gc_finish(struct cache_set *);
-void bch_moving_gc(struct closure *);
+void bch_moving_gc(struct cache_set *);
 int bch_btree_check(struct cache_set *);
 uint8_t __bch_btree_mark_key(struct cache_set *, int, struct bkey *);
 
-typedef int (btree_map_nodes_fn)(struct btree_op *, struct btree *);
+static inline void wake_up_gc(struct cache_set *c)
+{
+	if (c->gc_thread)
+		wake_up_process(c->gc_thread);
+}
 
 #define MAP_DONE	0
 #define MAP_CONTINUE	1
 
-#define MAP_LEAF_NODES	0
-#define MAP_ALL_NODES	1
+#define MAP_ALL_NODES	0
+#define MAP_LEAF_NODES	1
 
-int bch_btree_map_nodes(struct btree_op *, struct cache_set *, enum btree_id,
-			struct bkey *, btree_map_nodes_fn *, int);
+typedef int (btree_map_nodes_fn)(struct btree_op *, struct btree *);
+int __bch_btree_map_nodes(struct btree_op *, struct cache_set *, enum btree_id,
+			  struct bkey *, btree_map_nodes_fn *, int);
+
+static inline int bch_btree_map_nodes(struct btree_op *op, struct cache_set *c,
+				      enum btree_id id, struct bkey *from,
+				      btree_map_nodes_fn *fn)
+{
+	return __bch_btree_map_nodes(op, c, id, from, fn, MAP_ALL_NODES);
+}
+
+static inline int bch_btree_map_leaf_nodes(struct btree_op *op,
+					   struct cache_set *c,
+					   enum btree_id id,
+					   struct bkey *from,
+					   btree_map_nodes_fn *fn)
+{
+	return __bch_btree_map_nodes(op, c, id, from, fn, MAP_LEAF_NODES);
+}
 
 typedef int (btree_map_keys_fn)(struct btree_op *, struct btree *,
 				struct bkey *);

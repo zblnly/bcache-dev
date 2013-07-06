@@ -13,8 +13,6 @@
 #include <linux/seq_file.h>
 #include <linux/types.h>
 
-#include <linux/dynamic_fault.h>
-
 #include "util.h"
 
 #define simple_strtoint(c, end, base)	simple_strtol(c, end, base)
@@ -228,24 +226,6 @@ start:		bv->bv_len	= min_t(size_t, PAGE_SIZE - bv->bv_offset,
 
 		size -= bv->bv_len;
 	}
-}
-
-#undef bch_bio_alloc_pages
-int bch_bio_alloc_pages(struct bio *bio, gfp_t gfp)
-{
-	int i;
-	struct bio_vec *bv;
-
-	bio_for_each_segment(bv, bio, i) {
-		bv->bv_page = alloc_page(gfp);
-		if (!bv->bv_page) {
-			while (bv-- != bio->bi_io_vec + bio->bi_idx)
-				__free_page(bv->bv_page);
-			return -ENOMEM;
-		}
-	}
-
-	return 0;
 }
 
 /*

@@ -6,8 +6,6 @@
 int bch_bkey_to_text(char *buf, size_t size, const struct bkey *k);
 int bch_btree_to_text(char *buf, size_t size, const struct btree *b);
 
-void dump_bucket_and_panic(struct btree *b, const char *fmt, ...);
-
 #ifdef CONFIG_BCACHE_EDEBUG
 
 unsigned bch_count_data(struct btree *);

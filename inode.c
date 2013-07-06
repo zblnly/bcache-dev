@@ -17,7 +17,7 @@ void bch_inode_rm(struct cache_set *c, uint64_t inode_nr)
 	SET_KEY_DELETED(&inode.k, 1);
 
 	bch_keylist_add(&keys, &inode.k);
-	bch_btree_insert(&op, c, BTREE_ID_INODES, &keys);
+	bch_btree_insert(&op, c, BTREE_ID_INODES, &keys, NULL);
 }
 
 struct uuid_op {
@@ -61,7 +61,7 @@ insert:
 
 	bch_keylist_add(&u->keys, &u->inode->k);
 
-	return bch_btree_insert_node(b, op, &u->keys);
+	return bch_btree_insert_node(b, op, &u->keys, NULL);
 }
 
 int bch_uuid_inode_write_new(struct cache_set *c, struct bch_inode_uuid *u)
@@ -97,7 +97,7 @@ void bch_uuid_inode_write(struct cache_set *c, struct bch_inode_uuid *u)
 
 	bch_keylist_add(&keys, &u->k);
 
-	bch_btree_insert(&op, c, BTREE_ID_INODES, &keys);
+	bch_btree_insert(&op, c, BTREE_ID_INODES, &keys, NULL);
 }
 
 static int uuid_inode_find_fn(struct btree_op *op, struct btree *b, struct bkey *k)

@@ -178,6 +178,7 @@ STORE(__cached_dev)
 					     disk.kobj);
 	unsigned v = size;
 	struct cache_set *c;
+	struct kobj_uevent_env *env;
 
 #define d_strtoul(var)		sysfs_strtoul(var, dc->var)
 #define d_strtoi_h(var)		sysfs_hatoi(var, dc->var)
@@ -222,16 +223,27 @@ STORE(__cached_dev)
 	}
 
 	if (attr == &sysfs_label) {
+		/* note: endlines are preserved */
+
 		mutex_lock(&dc->disk.inode_lock);
 
 		memcpy(dc->sb.label, buf, SB_LABEL_SIZE);
 		memcpy(dc->disk.inode.label, buf, SB_LABEL_SIZE);
 
 		bch_write_bdev_super(dc, NULL);
+
 		if (dc->disk.c)
 			bch_uuid_inode_write(dc->disk.c, &dc->disk.inode);
 
 		mutex_unlock(&dc->disk.inode_lock);
+
+		env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
+		add_uevent_var(env, "DRIVER=bcache");
+		add_uevent_var(env, "CACHED_UUID=%pU", dc->sb.uuid),
+		add_uevent_var(env, "CACHED_LABEL=%s", buf);
+		kobject_uevent_env(
+			&disk_to_dev(dc->disk.disk)->kobj, KOBJ_CHANGE, env->envp);
+		kfree(env);
 	}
 
 	if (attr == &sysfs_attach) {
@@ -548,7 +560,7 @@ STORE(__bch_cache_set)
 	}
 
 	if (attr == &sysfs_trigger_gc)
-		bch_queue_gc(c);
+		wake_up_gc(c);
 
 	if (attr == &sysfs_prune_cache) {
 		struct shrink_control sc;

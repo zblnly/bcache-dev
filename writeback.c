@@ -255,6 +255,7 @@ void bcache_dev_sectors_dirty_add(struct cache_set *c, unsigned inode,
 	if (!d)
 		return;
 
+	stripe_size = 1 << d->stripe_size_bits;
 	stripe = offset >> d->stripe_size_bits;
 	stripe_size = 1 << d->stripe_size_bits;
 	stripe_offset = offset & (stripe_size - 1);
@@ -288,9 +289,10 @@ static void write_dirty_finish(struct closure *cl)
 	struct dirty_io *io = container_of(cl, struct dirty_io, cl);
 	struct keybuf_key *w = io->bio.bi_private;
 	struct cached_dev *dc = io->dc;
-	struct bio_vec *bv = bio_iovec_idx(&io->bio, io->bio.bi_vcnt);
+	struct bio_vec *bv;
+	int i;
 
-	while (bv-- != io->bio.bi_io_vec)
+	bio_for_each_segment_all(bv, &io->bio, i)
 		__free_page(bv->bv_page);
 
 	/* This is kind of a dumb way of signalling errors. */
@@ -311,7 +313,8 @@ static void write_dirty_finish(struct closure *cl)
 		for (i = 0; i < KEY_PTRS(&w->key); i++)
 			atomic_inc(&PTR_BUCKET(dc->disk.c, &w->key, i)->pin);
 
-		bch_btree_insert(&op, dc->disk.c, BTREE_ID_EXTENTS, &keys);
+		bch_btree_insert(&op, dc->disk.c, BTREE_ID_EXTENTS,
+				 &keys, NULL);
 
 		if (op.insert_collision)
 			trace_bcache_writeback_collision(&w->key);
@@ -423,7 +426,7 @@ static void read_dirty(struct closure *cl)
 		io->bio.bi_rw		= READ;
 		io->bio.bi_end_io	= read_dirty_endio;
 
-		if (bch_bio_alloc_pages(&io->bio, GFP_KERNEL))
+		if (bio_alloc_pages(&io->bio, GFP_KERNEL))
 			goto err_free;
 
 		trace_bcache_writeback(&w->key);
@@ -449,17 +452,16 @@ err:
 
 /* Init */
 
-struct sectors_dirty_op {
-	unsigned inode;
-	struct btree_op op;
+struct sectors_dirty_init {
+	struct btree_op	op;
+	unsigned	inode;
 };
 
 static int sectors_dirty_init_fn(struct btree_op *_op, struct btree *b,
 				 struct bkey *k)
 {
-	struct sectors_dirty_op *op = container_of(_op,
-					struct sectors_dirty_op, op);
-
+	struct sectors_dirty_init *op = container_of(_op,
+						struct sectors_dirty_init, op);
 	if (KEY_INODE(k) > op->inode)
 		return MAP_DONE;
 
@@ -472,10 +474,10 @@ static int sectors_dirty_init_fn(struct btree_op *_op, struct btree *b,
 
 void bch_sectors_dirty_init(struct cached_dev *dc)
 {
-	struct sectors_dirty_op op;
+	struct sectors_dirty_init op;
 
-	op.inode = KEY_INODE(&dc->disk.inode.k);
 	bch_btree_op_init_stack(&op.op);
+	op.inode = KEY_INODE(&dc->disk.inode.k);
 
 	bch_btree_map_keys(&op.op, dc->disk.c, BTREE_ID_EXTENTS,
 			   &KEY(op.inode, 0, 0), sectors_dirty_init_fn, 0);
@@ -485,6 +487,7 @@ void bch_cached_dev_writeback_init(struct cached_dev *dc)
 {
 	closure_init_unlocked(&dc->writeback);
 	init_rwsem(&dc->writeback_lock);
+	init_waitqueue_head(&dc->writeback_wait);
 
 	bch_keybuf_init(&dc->writeback_keys);
 

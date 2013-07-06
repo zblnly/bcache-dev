@@ -784,7 +784,7 @@ struct cache_set {
 	struct gc_stat		gc_stats;
 	size_t			nbuckets;
 
-	struct closure_with_waitlist gc;
+	struct task_struct	*gc_thread;
 	/* Where in the btree gc currently is */
 	enum btree_id		gc_cur_btree;
 	struct bkey		gc_cur_key;
@@ -798,7 +798,6 @@ struct cache_set {
 	/* Counts how many sectors bio_insert has added to the cache */
 	atomic_t		sectors_to_gc;
 
-	struct closure		moving_gc;
 	wait_queue_head_t	moving_gc_wait;
 	struct keybuf		moving_gc_keys;
 	/* Number of moving GC bios in flight */
@@ -1185,7 +1184,7 @@ void bch_write_bdev_super(struct cached_dev *, struct closure *);
 struct bcache_device *bch_dev_find(struct cache_set *c, uint64_t inode);
 struct bcache_device *bch_dev_get_by_inode(struct cache_set *c, uint64_t inode);
 
-extern struct workqueue_struct *bcache_wq, *bch_gc_wq;
+extern struct workqueue_struct *bcache_wq;
 extern const char * const bch_cache_modes[];
 extern struct mutex bch_register_lock;
 extern struct list_head bch_cache_sets;

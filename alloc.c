@@ -279,7 +279,7 @@ static void invalidate_buckets_lru(struct cache *ca)
 			 * multiple times when it can't do anything
 			 */
 			ca->invalidate_needs_gc = 1;
-			bch_queue_gc(ca->set);
+			wake_up_gc(ca->set);
 			return;
 		}
 
@@ -304,7 +304,7 @@ static void invalidate_buckets_fifo(struct cache *ca)
 
 		if (++checked >= ca->sb.nbuckets) {
 			ca->invalidate_needs_gc = 1;
-			bch_queue_gc(ca->set);
+			wake_up_gc(ca->set);
 			return;
 		}
 	}
@@ -329,7 +329,7 @@ static void invalidate_buckets_random(struct cache *ca)
 
 		if (++checked >= ca->sb.nbuckets / 2) {
 			ca->invalidate_needs_gc = 1;
-			bch_queue_gc(ca->set);
+			wake_up_gc(ca->set);
 			return;
 		}
 	}
@@ -455,18 +455,23 @@ static int bch_allocator_thread(void *arg)
 long bch_bucket_alloc(struct cache *ca, unsigned watermark, bool wait)
 {
 	DEFINE_WAIT(w);
-	long r = -1;
 	struct bucket *b;
+	long r;
+
+	/* fastpath */
+	if (fifo_used(&ca->free) > ca->watermark[watermark]) {
+		fifo_pop(&ca->free, r);
+		goto out;
+	}
+
+	if (!wait)
+		return -1;
 
 	while (1) {
-		wake_up_process(ca->alloc_thread);
-
-		if (fifo_used(&ca->free) > ca->watermark[watermark] &&
-		    fifo_pop(&ca->free, r))
+		if (fifo_used(&ca->free) > ca->watermark[watermark]) {
+			fifo_pop(&ca->free, r);
 			break;
-
-		if (!wait)
-			return -1;
+		}
 
 		prepare_to_wait(&ca->set->bucket_wait, &w,
 				TASK_UNINTERRUPTIBLE);
@@ -477,7 +482,8 @@ long bch_bucket_alloc(struct cache *ca, unsigned watermark, bool wait)
 	}
 
 	finish_wait(&ca->set->bucket_wait, &w);
-	b = ca->buckets + r;
+out:
+	wake_up_process(ca->alloc_thread);
 
 #ifdef CONFIG_BCACHE_EDEBUG
 	{
@@ -495,6 +501,8 @@ long bch_bucket_alloc(struct cache *ca, unsigned watermark, bool wait)
 			BUG_ON(i == r);
 	}
 #endif
+	b = ca->buckets + r;
+
 	BUG_ON(atomic_read(&b->pin) != 1);
 
 	SET_GC_SECTORS_USED(b, ca->sb.bucket_size);

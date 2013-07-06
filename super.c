@@ -517,11 +517,10 @@ static int open_dev(struct block_device *b, fmode_t mode)
 	return 0;
 }
 
-static int release_dev(struct gendisk *b, fmode_t mode)
+static void release_dev(struct gendisk *b, fmode_t mode)
 {
 	struct bcache_device *d = b->private_data;
 	closure_put(&d->cl);
-	return 0;
 }
 
 static int ioctl_dev(struct block_device *b, fmode_t mode,
@@ -718,6 +717,17 @@ static void calc_cached_dev_sectors(struct cache_set *c)
 void bch_cached_dev_run(struct cached_dev *dc)
 {
 	struct bcache_device *d = &dc->disk;
+	char buf[SB_LABEL_SIZE + 1];
+	char *env[] = {
+		"DRIVER=bcache",
+		kasprintf(GFP_KERNEL, "CACHED_UUID=%pU", dc->sb.uuid),
+		NULL,
+		NULL,
+	};
+
+	memcpy(buf, dc->sb.label, SB_LABEL_SIZE);
+	buf[SB_LABEL_SIZE] = '\0';
+	env[2] = kasprintf(GFP_KERNEL, "CACHED_LABEL=%s", buf);
 
 	if (atomic_xchg(&dc->running, 1))
 		return;
@@ -734,10 +744,12 @@ void bch_cached_dev_run(struct cached_dev *dc)
 
 	add_disk(d->disk);
 	bd_link_disk_holder(dc->bdev, dc->disk.disk);
-#if 0
-	char *env[] = { "SYMLINK=label" , NULL };
+	/* won't show up in the uevent file, use udevadm monitor -e instead
+	 * only class / kset properties are persistent */
 	kobject_uevent_env(&disk_to_dev(d->disk)->kobj, KOBJ_CHANGE, env);
-#endif
+	kfree(env[1]);
+	kfree(env[2]);
+
 	if (sysfs_create_link(&d->kobj, &disk_to_dev(d->disk)->kobj, "dev") ||
 	    sysfs_create_link(&disk_to_dev(d->disk)->kobj, &d->kobj, "bcache"))
 		pr_debug("error creating sysfs link");
@@ -950,7 +962,6 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 	kobject_init(&dc->disk.kobj, &bch_cached_dev_ktype);
 	INIT_WORK(&dc->detach, cached_dev_detach_finish);
 	closure_init_unlocked(&dc->sb_write);
-	init_waitqueue_head(&dc->writeback_wait);
 	INIT_LIST_HEAD(&dc->io_lru);
 	spin_lock_init(&dc->io_lock);
 	bch_cache_accounting_init(&dc->accounting, &dc->disk.cl);
@@ -1220,6 +1231,7 @@ static void cache_set_flush(struct closure *cl)
 
 	/* Shut down allocator threads */
 	set_bit(CACHE_SET_STOPPING_2, &c->flags);
+	wake_up_gc(c);
 	wake_up_allocators(c);
 
 	bch_cache_accounting_destroy(&c->accounting);
@@ -1319,15 +1331,17 @@ struct cache_set *bch_cache_set_alloc(struct cache_sb *sb)
 
 	c->sort_crit_factor = int_sqrt(c->btree_pages);
 
+	closure_init_unlocked(&c->sb_write);
 	c->devices = RB_ROOT;
 	spin_lock_init(&c->devices_lock);
 	mutex_init(&c->bucket_lock);
-	mutex_init(&c->sort_lock);
+	init_waitqueue_head(&c->try_wait);
+	init_waitqueue_head(&c->bucket_wait);
 	spin_lock_init(&c->btree_root_lock);
 	spin_lock_init(&c->sort_time_lock);
-	init_waitqueue_head(&c->moving_gc_wait);
-	closure_init_unlocked(&c->sb_write);
+	mutex_init(&c->sort_lock);
 	spin_lock_init(&c->btree_read_time_lock);
+
 	bch_moving_init_cache_set(c);
 
 	INIT_LIST_HEAD(&c->list);
@@ -1470,8 +1484,6 @@ static void run_cache_set(struct cache_set *c)
 		bch_journal_replay(c, &journal);
 	} else {
 		pr_notice("invalidating existing data");
-		/* Don't want invalidate_buckets() to queue a gc yet */
-		closure_lock(&c->gc, NULL);
 
 		for_each_cache(ca, c, i) {
 			unsigned j;
@@ -1499,7 +1511,7 @@ static void run_cache_set(struct cache_set *c)
 			err = "cannot allocate new btree root";
 			b = bch_btree_node_alloc(c, 0, id);
 			if (IS_ERR_OR_NULL(b))
-				goto err_unlock_gc;
+				goto err;
 
 			bkey_copy_key(&b->key, &MAX_KEY);
 			bch_btree_node_write(b, &cl);
@@ -1517,11 +1529,11 @@ static void run_cache_set(struct cache_set *c)
 
 		bch_journal_next(&c->journal);
 		bch_journal_meta(c, &cl);
-
-		/* Unlock */
-		closure_set_stopped(&c->gc.cl);
-		closure_put(&c->gc.cl);
 	}
+
+	err = "error starting gc thread";
+	if (bch_gc_thread_start(c))
+		goto err;
 
 	closure_sync(&cl);
 	c->sb.last_mount = get_seconds();
@@ -1533,9 +1545,6 @@ static void run_cache_set(struct cache_set *c)
 	flash_devs_run(c);
 
 	return;
-err_unlock_gc:
-	closure_set_stopped(&c->gc.cl);
-	closure_put(&c->gc.cl);
 err:
 	closure_sync(&cl);
 	/* XXX: test this, it's broken */

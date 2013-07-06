@@ -84,6 +84,8 @@ int bch_btree_to_text(char *buf, size_t size, const struct btree *b)
 			 btree_node_root(b) ? btree_node_root(b)->level : -1);
 }
 
+#if defined(CONFIG_BCACHE_DEBUG) || defined(CONFIG_BCACHE_EDEBUG)
+
 static bool skipped_backwards(struct btree *b, struct bkey *k)
 {
 	return bkey_cmp(k, (!b->level)
@@ -119,33 +121,7 @@ static void dump_bset(struct btree *b, struct bset *i)
 	}
 }
 
-static void vdump_bucket_and_panic(struct btree *b, const char *fmt,
-				   va_list args)
-{
-	unsigned i;
-	char buf[80];
-
-	console_lock();
-
-	for (i = 0; i <= b->nsets; i++)
-		dump_bset(b, b->sets[i].data);
-
-	vprintk(fmt, args);
-
-	console_unlock();
-
-	bch_btree_to_text(buf, sizeof(buf), b);
-	panic("at %s\n", buf);
-}
-
-void dump_bucket_and_panic(struct btree *b, const char *fmt, ...)
-{
-	va_list args;
-	va_start(args, fmt);
-
-	vdump_bucket_and_panic(b, fmt, args);
-	va_end(args);
-}
+#endif
 
 #ifdef CONFIG_BCACHE_DEBUG
 
@@ -223,7 +199,7 @@ void bch_data_verify(struct search *s)
 	if (!check)
 		return;
 
-	if (bch_bio_alloc_pages(check, GFP_NOIO))
+	if (bio_alloc_pages(check, GFP_NOIO))
 		goto out_put;
 
 	check->bi_rw		= READ_SYNC;
@@ -269,6 +245,25 @@ unsigned bch_count_data(struct btree *b)
 		for_each_key(b, k, &iter)
 			ret += KEY_SIZE(k);
 	return ret;
+}
+
+static void vdump_bucket_and_panic(struct btree *b, const char *fmt,
+				   va_list args)
+{
+	unsigned i;
+	char buf[80];
+
+	console_lock();
+
+	for (i = 0; i <= b->nsets; i++)
+		dump_bset(b, b->sets[i].data);
+
+	vprintk(fmt, args);
+
+	console_unlock();
+
+	bch_btree_to_text(buf, sizeof(buf), b);
+	panic("at %s\n", buf);
 }
 
 void bch_check_key_order_msg(struct btree *b, struct bset *i,
