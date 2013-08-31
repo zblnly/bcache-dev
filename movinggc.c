@@ -12,8 +12,9 @@
 #include <trace/events/bcache.h>
 
 struct moving_io {
+	struct closure		cl;
 	struct keybuf_key	*w;
-	struct search		s;
+	struct data_insert_op	op;
 	struct bbio		bio;
 };
 
@@ -38,13 +39,13 @@ static bool moving_pred(struct keybuf *buf, struct bkey *k)
 
 static void moving_io_destructor(struct closure *cl)
 {
-	struct moving_io *io = container_of(cl, struct moving_io, s.cl);
+	struct moving_io *io = container_of(cl, struct moving_io, cl);
 	kfree(io);
 }
 
 static void write_moving_finish(struct closure *cl)
 {
-	struct moving_io *io = container_of(cl, struct moving_io, s.cl);
+	struct moving_io *io = container_of(cl, struct moving_io, cl);
 	struct bio *bio = &io->bio.bio;
 	struct bio_vec *bv;
 	int i;
@@ -52,13 +53,12 @@ static void write_moving_finish(struct closure *cl)
 	bio_for_each_segment_all(bv, bio, i)
 		__free_page(bv->bv_page);
 
-	if (io->s.op.insert_collision)
+	if (io->op.replace_collision)
 		trace_bcache_gc_copy_collision(&io->w->key);
 
-	bch_keybuf_del(&io->s.c->moving_gc_keys, io->w);
+	bch_keybuf_del(&io->op.c->moving_gc_keys, io->w);
 
-	atomic_dec_bug(&io->s.c->in_flight);
-	wake_up(&io->s.c->moving_gc_wait);
+	up(&io->op.c->moving_in_flight);
 
 	closure_return_with_destructor(cl, moving_io_destructor);
 }
@@ -66,12 +66,12 @@ static void write_moving_finish(struct closure *cl)
 static void read_moving_endio(struct bio *bio, int error)
 {
 	struct moving_io *io = container_of(bio->bi_private,
-					    struct moving_io, s.cl);
+					    struct moving_io, cl);
 
 	if (error)
-		io->s.error = error;
+		io->op.error = error;
 
-	bch_bbio_endio(io->s.c, bio, error, "reading data to move");
+	bch_bbio_endio(io->op.c, bio, error, "reading data to move");
 }
 
 static void moving_init(struct moving_io *io)
@@ -82,35 +82,33 @@ static void moving_init(struct moving_io *io)
 	bio_get(bio);
 	bio_set_prio(bio, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0));
 
-	bio->bi_size		= KEY_SIZE(&io->w->key) << 9;
+	bio->bi_iter.bi_size	= KEY_SIZE(&io->w->key) << 9;
 	bio->bi_max_vecs	= DIV_ROUND_UP(KEY_SIZE(&io->w->key),
 					       PAGE_SECTORS);
-	bio->bi_private		= &io->s.cl;
+	bio->bi_private		= &io->cl;
 	bio->bi_io_vec		= bio->bi_inline_vecs;
 	bch_bio_map(bio, NULL);
 }
 
 static void write_moving(struct closure *cl)
 {
-	struct search *s = container_of(cl, struct search, cl);
-	struct moving_io *io = container_of(s, struct moving_io, s);
+	struct moving_io *io = container_of(cl, struct moving_io, cl);
+	struct data_insert_op *op = &io->op;
 
-	if (!s->error) {
+	if (!op->error) {
 		moving_init(io);
 
-		io->bio.bio.bi_sector	= KEY_START(&io->w->key);
-		s->op.lock		= -1;
-		s->write_prio		= 1;
-		s->cache_bio		= &io->bio.bio;
+		io->bio.bio.bi_iter.bi_sector = KEY_START(&io->w->key);
+		op->write_prio		= 1;
+		op->bio			= &io->bio.bio;
 
-		s->writeback		= KEY_DIRTY(&io->w->key);
-		s->csum			= KEY_CSUM(&io->w->key);
+		op->cached		= KEY_CACHED(&io->w->key);
+		op->csum		= KEY_CSUM(&io->w->key);
 
-		s->op.type = BTREE_REPLACE;
-		bkey_copy(&s->op.replace, &io->w->key);
+		bkey_copy(&op->replace_key, &io->w->key);
+		op->replace		= true;
 
-		closure_init(&s->btree, cl);
-		bch_data_insert(&s->btree);
+		closure_call(&op->cl, bch_data_insert, NULL, cl);
 	}
 
 	continue_at(cl, write_moving_finish, NULL);
@@ -118,11 +116,10 @@ static void write_moving(struct closure *cl)
 
 static void read_moving_submit(struct closure *cl)
 {
-	struct search *s = container_of(cl, struct search, cl);
-	struct moving_io *io = container_of(s, struct moving_io, s);
+	struct moving_io *io = container_of(cl, struct moving_io, cl);
 	struct bio *bio = &io->bio.bio;
 
-	bch_submit_bbio(bio, s->c, &io->w->key, 0);
+	bch_submit_bbio(bio, io->op.c, &io->w->key, 0);
 
 	continue_at(cl, write_moving, system_wq);
 }
@@ -152,8 +149,8 @@ static void read_moving(struct cache_set *c)
 
 		w->private	= io;
 		io->w		= w;
-		io->s.inode	= KEY_INODE(&w->key);
-		io->s.c		= c;
+		io->op.inode	= KEY_INODE(&w->key);
+		io->op.c	= c;
 
 		moving_init(io);
 		bio = &io->bio.bio;
@@ -166,11 +163,8 @@ static void read_moving(struct cache_set *c)
 
 		trace_bcache_gc_copy(&w->key);
 
-		closure_call(&io->s.cl, read_moving_submit, NULL, &cl);
-
-		atomic_inc(&c->in_flight);
-		wait_event(c->moving_gc_wait,
-			   atomic_read(&c->in_flight) < 64);
+		down(&c->moving_in_flight);
+		closure_call(&io->cl, read_moving_submit, NULL, &cl);
 	}
 
 	if (0) {
@@ -247,4 +241,5 @@ void bch_moving_gc(struct cache_set *c)
 void bch_moving_init_cache_set(struct cache_set *c)
 {
 	bch_keybuf_init(&c->moving_gc_keys);
+	sema_init(&c->moving_in_flight, 64);
 }

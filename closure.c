@@ -54,16 +54,18 @@ static inline void closure_put_after_sub(struct closure *cl, int flags)
 		} else {
 			struct closure *parent = cl->parent;
 			struct closure_waitlist *wait = closure_waitlist(cl);
+			closure_fn *destructor = cl->fn;
 
 			closure_debug_destroy(cl);
 
+			smp_mb();
 			atomic_set(&cl->remaining, -1);
 
 			if (wait)
 				closure_wake_up(wait);
 
-			if (cl->fn)
-				cl->fn(cl);
+			if (destructor)
+				destructor(cl);
 
 			if (parent)
 				closure_put(parent);
@@ -169,13 +171,13 @@ bool closure_trylock(struct closure *cl, struct closure *parent)
 			   CLOSURE_REMAINING_INITIALIZER) != -1)
 		return false;
 
-	closure_set_ret_ip(cl);
-
 	smp_mb();
+
 	cl->parent = parent;
 	if (parent)
 		closure_get(parent);
 
+	closure_set_ret_ip(cl);
 	closure_debug_create(cl);
 	return true;
 }

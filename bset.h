@@ -142,6 +142,8 @@
  * first key in that range of bytes again.
  */
 
+struct cache_set;
+
 /* Btree key comparison/iteration */
 
 #define MAX_BSETS		4U
@@ -151,6 +153,9 @@ struct btree_iter {
 	struct btree_iter_set {
 		struct bkey *k, *end;
 	} data[MAX_BSETS];
+#ifdef CONFIG_BCACHE_DEBUG
+	struct btree *b;
+#endif
 };
 
 struct bset_tree {
@@ -191,34 +196,6 @@ static __always_inline int64_t bkey_cmp(const struct bkey *l,
 	return unlikely(KEY_INODE(l) != KEY_INODE(r))
 		? (int64_t) KEY_INODE(l) - (int64_t) KEY_INODE(r)
 		: (int64_t) KEY_OFFSET(l) - (int64_t) KEY_OFFSET(r);
-}
-
-static inline size_t bkey_u64s(const struct bkey *k)
-{
-	BUG_ON(KEY_CSUM(k) > 1);
-	return 2 + KEY_PTRS(k) + (KEY_CSUM(k) ? 1 : 0);
-}
-
-static inline size_t bkey_bytes(const struct bkey *k)
-{
-	return bkey_u64s(k) * sizeof(uint64_t);
-}
-
-static inline void bkey_copy(struct bkey *dest, const struct bkey *src)
-{
-	memcpy(dest, src, bkey_bytes(src));
-}
-
-static inline void bkey_copy_key(struct bkey *dest, const struct bkey *src)
-{
-	SET_KEY_INODE(dest, KEY_INODE(src));
-	SET_KEY_OFFSET(dest, KEY_OFFSET(src));
-}
-
-static inline struct bkey *bkey_next(const struct bkey *k)
-{
-	uint64_t *d = (void *) k;
-	return (struct bkey *) (d + bkey_u64s(k));
 }
 
 /* Keylists */
@@ -304,28 +281,8 @@ static inline bool bch_cut_back(const struct bkey *where, struct bkey *k)
 const char *bch_ptr_status(struct cache_set *, const struct bkey *);
 bool bch_btree_ptr_invalid(struct cache_set *, const struct bkey *);
 bool bch_extent_ptr_invalid(struct cache_set *, const struct bkey *);
-
-bool bch_ptr_invalid(struct btree *b, const struct bkey *k);
-bool bch_ptr_bad(struct btree *, const struct bkey *);
-
-static inline uint8_t gen_after(uint8_t a, uint8_t b)
-{
-	uint8_t r = a - b;
-	return r > 128U ? 0 : r;
-}
-
-static inline uint8_t ptr_stale(struct cache_set *c, const struct bkey *k,
-				unsigned i)
-{
-	return gen_after(PTR_BUCKET(c, k, i)->gen, PTR_GEN(k, i));
-}
-
-static inline bool ptr_available(struct cache_set *c, const struct bkey *k,
-				 unsigned i)
-{
-	return (PTR_DEV(k, i) < MAX_CACHES_PER_SET) && PTR_CACHE(c, k, i);
-}
-
+bool bch_btree_ptr_bad(struct btree *, const struct bkey *);
+bool bch_extent_ptr_bad(struct btree *, const struct bkey *);
 
 typedef bool (*ptr_filter_fn)(struct btree *, const struct bkey *);
 
@@ -334,13 +291,13 @@ struct bkey *bch_btree_iter_next_filter(struct btree_iter *,
 					struct btree *, ptr_filter_fn);
 
 void bch_btree_iter_push(struct btree_iter *, struct bkey *, struct bkey *);
-struct bkey *__bch_btree_iter_init(struct btree *, struct btree_iter *,
-				   struct bkey *, struct bset_tree *);
+struct bkey *bch_btree_iter_init(struct btree *, struct btree_iter *,
+				 struct bkey *);
 
 /* 32 bits total: */
-#define BKEY_MID_BITS		3
+#define BKEY_MID_BITS		5
 #define BKEY_EXPONENT_BITS	7
-#define BKEY_MANTISSA_BITS	22
+#define BKEY_MANTISSA_BITS	(32 - BKEY_MID_BITS - BKEY_EXPONENT_BITS)
 #define BKEY_MANTISSA_MASK	((1 << BKEY_MANTISSA_BITS) - 1)
 
 struct bkey_float {
@@ -364,7 +321,7 @@ struct bkey_float {
  * gets to the second cacheline.
  */
 
-#define BSET_CACHELINE		128
+#define BSET_CACHELINE		256
 #define bset_tree_space(b)	(btree_data_space(b) / BSET_CACHELINE)
 
 #define bset_tree_bytes(b)	(bset_tree_space(b) * sizeof(struct bkey_float))
@@ -391,11 +348,8 @@ static inline struct bkey *bch_bset_search(struct btree *b, struct bset_tree *t,
 ({								\
 	struct bkey *_ret = NULL;				\
 								\
-	if (KEY_INODE(_k) || KEY_OFFSET(_k)) {			\
+	if ((_k)->low) {					\
 		_ret = &KEY(KEY_INODE(_k), KEY_OFFSET(_k), 0);	\
-								\
-		if (!_ret->low)					\
-			_ret->high--;				\
 		_ret->low--;					\
 	}							\
 								\

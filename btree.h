@@ -194,17 +194,30 @@ static inline bool bkey_written(struct btree *b, struct bkey *k)
 
 static inline void set_gc_sectors(struct cache_set *c)
 {
-	atomic_set(&c->sectors_to_gc, c->sb.bucket_size * c->nbuckets / 8);
+	atomic_set(&c->sectors_to_gc, c->sb.bucket_size * c->nbuckets / 16);
 }
 
-static inline struct bkey *bch_btree_iter_init(struct btree *b,
-					       struct btree_iter *iter,
-					       struct bkey *search)
+static inline bool bch_ptr_invalid(struct btree *b, const struct bkey *k)
 {
-	return __bch_btree_iter_init(b, iter, search, b->sets);
+	if (b->level)
+		return bch_btree_ptr_invalid(b->c, k);
+	else if (b->btree_id == BTREE_ID_EXTENTS)
+		return bch_extent_ptr_invalid(b->c, k);
+	else
+		return false;
 }
 
-void __bkey_put(struct cache_set *c, struct bkey *k);
+static inline bool bch_ptr_bad(struct btree *b, const struct bkey *k)
+{
+	if (b->level)
+		return bch_btree_ptr_bad(b, k);
+	else if (b->btree_id == BTREE_ID_EXTENTS)
+		return bch_extent_ptr_bad(b, k);
+	else
+		return KEY_DELETED(k);
+}
+
+void bkey_put(struct cache_set *c, struct bkey *k);
 
 /* Looping macros */
 
@@ -228,25 +241,14 @@ struct btree_op {
 	/* Btree level at which we start taking write locks */
 	short			lock;
 
-	/* Btree insertion type */
-	enum {
-		BTREE_INSERT,
-		BTREE_REPLACE
-	} type:8;
-
 	unsigned		insert_collision:1;
-
-	BKEY_PADDED(replace);
 };
 
-enum {
-	BTREE_INSERT_STATUS_INSERT,
-	BTREE_INSERT_STATUS_BACK_MERGE,
-	BTREE_INSERT_STATUS_OVERWROTE,
-	BTREE_INSERT_STATUS_FRONT_MERGE,
-};
-
-void bch_btree_op_init_stack(struct btree_op *);
+static inline void bch_btree_op_init(struct btree_op *op, int write_lock_level)
+{
+	memset(op, 0, sizeof(struct btree_op));
+	op->lock = write_lock_level;
+}
 
 static inline void rw_lock(bool w, struct btree *b, int level)
 {
@@ -258,14 +260,6 @@ static inline void rw_lock(bool w, struct btree *b, int level)
 
 static inline void rw_unlock(bool w, struct btree *b)
 {
-#ifdef CONFIG_BCACHE_EDEBUG
-	unsigned i;
-
-	if (w && b->key.ptr[0])
-		for (i = 0; i <= b->nsets; i++)
-			bch_check_key_order(b, b->sets[i].data);
-#endif
-
 	if (w)
 		b->seq++;
 	(w ? up_write : up_read)(&b->lock);
@@ -277,16 +271,19 @@ void bch_btree_node_read(struct btree *);
 void bch_btree_node_write(struct btree *, struct closure *);
 
 void bch_btree_set_root(struct btree *);
-struct btree *bch_btree_node_alloc(struct cache_set *, int, enum btree_id);
+struct btree *bch_btree_node_alloc(struct cache_set *, int,
+				   enum btree_id, bool);
 struct btree *bch_btree_node_get(struct cache_set *, struct bkey *,
 				 int, enum btree_id, bool);
 
 int bch_btree_insert_check_key(struct btree *, struct btree_op *,
 			       struct bkey *);
-int bch_btree_insert(struct btree_op *, struct cache_set *,
-		     enum btree_id, struct keylist *, atomic_t *);
+int bch_btree_insert(struct cache_set *, enum btree_id,
+		     struct keylist *, atomic_t *, struct bkey *);
+int bch_btree_insert_journalled(struct cache_set *, enum btree_id,
+				struct keylist *, struct closure *);
 int bch_btree_insert_node(struct btree *, struct btree_op *,
-			  struct keylist *, atomic_t *);
+			  struct keylist *, atomic_t *, struct bkey *);
 
 int bch_gc_thread_start(struct cache_set *);
 size_t bch_btree_gc_finish(struct cache_set *);
@@ -305,6 +302,8 @@ static inline void wake_up_gc(struct cache_set *c)
 
 #define MAP_ALL_NODES	0
 #define MAP_LEAF_NODES	1
+
+#define MAP_END_KEY	1
 
 typedef int (btree_map_nodes_fn)(struct btree_op *, struct btree *);
 int __bch_btree_map_nodes(struct btree_op *, struct cache_set *, enum btree_id,

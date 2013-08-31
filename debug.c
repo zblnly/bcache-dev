@@ -8,7 +8,6 @@
 #include "bcache.h"
 #include "btree.h"
 #include "debug.h"
-#include "request.h"
 
 #include <linux/console.h>
 #include <linux/debugfs.h>
@@ -69,37 +68,25 @@ int bch_bkey_to_text(char *buf, size_t size, const struct bkey *k)
 
 	p("]");
 
-	if (KEY_DIRTY(k))
-		p(" dirty");
+	if (KEY_CACHED(k))
+		p(" cached");
 	if (KEY_CSUM(k))
 		p(" cs%llu %llx", KEY_CSUM(k), k->ptr[1]);
 #undef p
 	return out - buf;
 }
 
-int bch_btree_to_text(char *buf, size_t size, const struct btree *b)
-{
-	return scnprintf(buf, size, "%zu level %i/%i",
-			 PTR_BUCKET_NR(b->c, &b->key, 0), b->level,
-			 btree_node_root(b) ? btree_node_root(b)->level : -1);
-}
-
-#if defined(CONFIG_BCACHE_DEBUG) || defined(CONFIG_BCACHE_EDEBUG)
-
-static bool skipped_backwards(struct btree *b, struct bkey *k)
-{
-	return bkey_cmp(k, (!b->level)
-			? &START_KEY(bkey_next(k))
-			: bkey_next(k)) > 0;
-}
+#ifdef CONFIG_BCACHE_DEBUG
 
 static void dump_bset(struct btree *b, struct bset *i)
 {
-	struct bkey *k;
+	struct bkey *k, *next;
 	unsigned j;
 	char buf[80];
 
-	for (k = i->start; k < end(i); k = bkey_next(k)) {
+	for (k = i->start; k < bset_last(i); k = next) {
+		next = bkey_next(k);
+
 		bch_bkey_to_text(buf, sizeof(buf), k);
 		printk(KERN_ERR "block %zu key %zi/%u: %s", index(i, b),
 		       (uint64_t *) k - i->d, i->keys, buf);
@@ -115,15 +102,21 @@ static void dump_bset(struct btree *b, struct bset *i)
 
 		printk(" %s\n", bch_ptr_status(b->c, k));
 
-		if (bkey_next(k) < end(i) &&
-		    skipped_backwards(b, k))
+		if (next < bset_last(i) &&
+		    bkey_cmp(k, !b->level ? &START_KEY(next) : next) > 0)
 			printk(KERN_ERR "Key skipped backwards\n");
 	}
 }
 
-#endif
+static void bch_dump_bucket(struct btree *b)
+{
+	unsigned i;
 
-#ifdef CONFIG_BCACHE_DEBUG
+	console_lock();
+	for (i = 0; i <= b->nsets; i++)
+		dump_bset(b, b->sets[i].data);
+	console_unlock();
+}
 
 void bch_btree_verify(struct btree *b, struct bset *new)
 {
@@ -150,7 +143,7 @@ void bch_btree_verify(struct btree *b, struct bset *new)
 	if (new->keys != v->sets[0].data->keys ||
 	    memcmp(new->start,
 		   v->sets[0].data->start,
-		   (void *) end(new) - (void *) new->start)) {
+		   (void *) bset_last(new) - (void *) new->start)) {
 		unsigned i, j;
 
 		console_lock();
@@ -182,20 +175,18 @@ static void data_verify_endio(struct bio *bio, int error)
 	closure_put(cl);
 }
 
-void bch_data_verify(struct search *s)
+void bch_data_verify(struct cached_dev *dc, struct bio *bio)
 {
 	char name[BDEVNAME_SIZE];
-	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
-	struct closure *cl = &s->cl;
+	struct closure cl;
 	struct bio *check;
-	struct bio_vec *bv;
+	struct bio_vec bv, *bv2;
+	struct bvec_iter iter;
 	int i;
 
-	if (!s->unaligned_bvec)
-		bio_for_each_segment(bv, s->orig_bio, i)
-			bv->bv_offset = 0, bv->bv_len = PAGE_SIZE;
+	closure_init_stack(&cl);
 
-	check = bio_clone(s->orig_bio, GFP_NOIO);
+	check = bio_clone(bio, GFP_NOIO);
 	if (!check)
 		return;
 
@@ -203,124 +194,101 @@ void bch_data_verify(struct search *s)
 		goto out_put;
 
 	check->bi_rw		= READ_SYNC;
-	check->bi_private	= cl;
+	check->bi_private	= &cl;
 	check->bi_end_io	= data_verify_endio;
 
-	closure_bio_submit(check, cl, &dc->disk);
-	closure_sync(cl);
+	closure_bio_submit(check, &cl, &dc->disk);
+	closure_sync(&cl);
 
-	bio_for_each_segment(bv, s->orig_bio, i) {
-		void *p1 = kmap(bv->bv_page);
-		void *p2 = kmap(check->bi_io_vec[i].bv_page);
+	bio_for_each_segment(bv, bio, iter) {
+		void *p1 = kmap(bv.bv_page);
+		void *p2 = kmap(check->bi_io_vec[iter.bi_idx].bv_page);
 
-		if (memcmp(p1 + bv->bv_offset,
-			   p2 + bv->bv_offset,
-			   bv->bv_len))
-			printk(KERN_ERR
-			       "bcache (%s): verify failed at sector %llu\n",
-			       bdevname(dc->bdev, name),
-			       (uint64_t) s->orig_bio->bi_sector);
+		cache_set_err_on(memcmp(p1 + bv.bv_offset,
+					p2 + bv.bv_offset,
+					bv.bv_len),
+				 dc->disk.c,
+				 "verify failed at dev %s sector %llu",
+				 bdevname(dc->bdev, name),
+				 (uint64_t) bio->bi_iter.bi_sector);
 
-		kunmap(bv->bv_page);
-		kunmap(check->bi_io_vec[i].bv_page);
+		kunmap(bv.bv_page);
+		kunmap(check->bi_io_vec[iter.bi_idx].bv_page);
 	}
 
-	__bio_for_each_segment(bv, check, i, 0)
-		__free_page(bv->bv_page);
+	bio_for_each_segment_all(bv2, check, i)
+		__free_page(bv2->bv_page);
 out_put:
 	bio_put(check);
 }
 
-#endif
-
-#ifdef CONFIG_BCACHE_EDEBUG
-
-unsigned bch_count_data(struct btree *b)
+int __bch_count_data(struct btree *b)
 {
 	unsigned ret = 0;
 	struct btree_iter iter;
 	struct bkey *k;
 
-	if (!b->level)
+	if (!b->level && b->btree_id == BTREE_ID_EXTENTS)
 		for_each_key(b, k, &iter)
 			ret += KEY_SIZE(k);
 	return ret;
 }
 
-static void vdump_bucket_and_panic(struct btree *b, const char *fmt,
-				   va_list args)
-{
-	unsigned i;
-	char buf[80];
-
-	console_lock();
-
-	for (i = 0; i <= b->nsets; i++)
-		dump_bset(b, b->sets[i].data);
-
-	vprintk(fmt, args);
-
-	console_unlock();
-
-	bch_btree_to_text(buf, sizeof(buf), b);
-	panic("at %s\n", buf);
-}
-
-void bch_check_key_order_msg(struct btree *b, struct bset *i,
-			     const char *fmt, ...)
-{
-	struct bkey *k;
-
-	if (!i->keys)
-		return;
-
-	for (k = i->start; bkey_next(k) < end(i); k = bkey_next(k))
-		if (skipped_backwards(b, k)) {
-			va_list args;
-			va_start(args, fmt);
-
-			vdump_bucket_and_panic(b, fmt, args);
-			va_end(args);
-		}
-}
-
-void bch_check_keys(struct btree *b, const char *fmt, ...)
+void __bch_check_keys(struct btree *b, const char *fmt, ...)
 {
 	va_list args;
 	struct bkey *k, *p = NULL;
 	struct btree_iter iter;
+	const char *err;
 
-	if (!b->level && b->btree_id == BTREE_ID_EXTENTS) {
-		for_each_key(b, k, &iter) {
-			if (p && bkey_cmp(&START_KEY(p), &START_KEY(k)) > 0) {
-				printk(KERN_ERR "Keys out of order:\n");
+	for_each_key(b, k, &iter) {
+		if (!b->level && b->btree_id == BTREE_ID_EXTENTS) {
+			err = "Keys out of order";
+			if (p && bkey_cmp(&START_KEY(p), &START_KEY(k)) > 0)
 				goto bug;
-			}
 
 			if (bch_ptr_invalid(b, k))
 				continue;
 
-			if (p && bkey_cmp(p, &START_KEY(k)) > 0) {
-				printk(KERN_ERR "Overlapping keys:\n");
+			err =  "Overlapping keys";
+			if (p && bkey_cmp(p, &START_KEY(k)) > 0)
 				goto bug;
-			}
-			p = k;
-		}
-	} else {
-		for_each_key_filter(b, k, &iter, bch_ptr_bad) {
-			if (p && !bkey_cmp(p, k)) {
-				printk(KERN_ERR "Duplicate keys:\n");
-				goto bug;
-			}
+		} else {
+			if (bch_ptr_bad(b, k))
+				continue;
 
-			p = k;
+			err = "Duplicate keys";
+			if (p && !bkey_cmp(p, k))
+				goto bug;
 		}
+		p = k;
 	}
+
+	err = "Key larger than btree node key";
+	if (p && bkey_cmp(p, &b->key) > 0)
+		goto bug;
+
 	return;
 bug:
+	bch_dump_bucket(b);
+
 	va_start(args, fmt);
-	vdump_bucket_and_panic(b, fmt, args);
+	vprintk(fmt, args);
 	va_end(args);
+
+	panic("bcache error (btree %u level %u): %s:\n",
+	      b->btree_id, b->level, err);
+}
+
+void bch_btree_iter_next_check(struct btree_iter *iter)
+{
+	struct bkey *k = iter->data->k, *next = bkey_next(k);
+
+	if (next < iter->data->end &&
+	    bkey_cmp(k, iter->b->level ? next : &START_KEY(next)) > 0) {
+		bch_dump_bucket(iter->b);
+		panic("Key skipped backwards\n");
+	}
 }
 
 #endif
